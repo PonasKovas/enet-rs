@@ -17,10 +17,10 @@ use crate::{
     protocol::{
         self, AcknowledgeCmd, ConnectCmd, Command, CommandBody, CommandHeader, ProtocolHeader,
         VerifyConnectCmd,
-        CHANNEL_ID_CONNECTION, CMD_ACKNOWLEDGE, CMD_CONNECT, CMD_DISCONNECT, CMD_PING,
-        CMD_SEND_FRAGMENT, CMD_SEND_RELIABLE, CMD_SEND_UNRELIABLE,
-        CMD_SEND_UNRELIABLE_FRAGMENT, CMD_SEND_UNSEQUENCED, CMD_VERIFY_CONNECT,
-        COMMAND_FLAG_ACKNOWLEDGE, COMMAND_FLAG_UNSEQUENCED,
+        CHANNEL_ID_CONNECTION, CMD_ACKNOWLEDGE, CMD_BANDWIDTH_LIMIT, CMD_CONNECT, CMD_DISCONNECT,
+        CMD_PING, CMD_SEND_FRAGMENT, CMD_SEND_RELIABLE, CMD_SEND_UNRELIABLE,
+        CMD_SEND_UNRELIABLE_FRAGMENT, CMD_SEND_UNSEQUENCED, CMD_THROTTLE_CONFIGURE,
+        CMD_VERIFY_CONNECT, COMMAND_FLAG_ACKNOWLEDGE, COMMAND_FLAG_UNSEQUENCED,
         DEFAULT_PING_INTERVAL_MS, DEFAULT_RTT_MS, HEADER_FLAG_SENT_TIME, HEADER_SESSION_SHIFT,
         MAX_FRAGMENT_COUNT, MTU_DEFAULT, MTU_MAX, MTU_MIN, PEER_ID_UNASSIGNED,
         THROTTLE_ACCELERATION, THROTTLE_DECELERATION, THROTTLE_INTERVAL_MS, TIMEOUT_LIMIT,
@@ -75,7 +75,6 @@ struct OutstandingReliable {
 }
 
 struct PeerEntry {
-    key: PeerKey,
     addr: SocketAddr,
     state: PeerState,
 
@@ -86,7 +85,6 @@ struct PeerEntry {
 
     mtu: u32,
     window_size: u32,
-    channel_count: u8,
 
     throttle_interval: u32,
     throttle_acceleration: u32,
@@ -112,9 +110,6 @@ struct PeerEntry {
     connect_reply: Option<
         tokio::sync::oneshot::Sender<Result<(PeerKey, mpsc::Receiver<Packet>), Error>>,
     >,
-    /// True for server-side (incoming) peers; on connect they go to accept_tx.
-    is_incoming: bool,
-
     // Connection-level sequence number tracking
     incoming_reliable_seq: u16,
     outgoing_reliable_seq: u16,
@@ -160,8 +155,6 @@ pub(crate) struct HostTask {
 
     accept_tx: mpsc::Sender<(PeerKey, mpsc::Receiver<Packet>)>,
     user_rx: mpsc::Receiver<ToTask>,
-    /// Sender for user → task messages, stored so we can hand it to new Peers.
-    user_tx: mpsc::Sender<ToTask>,
 
     host_mtu: u32,
     incoming_bandwidth: u32,
@@ -174,7 +167,6 @@ impl HostTask {
     pub fn new(
         socket: std::sync::Arc<UdpSocket>,
         accept_tx: mpsc::Sender<(PeerKey, mpsc::Receiver<Packet>)>,
-        user_tx: mpsc::Sender<ToTask>,
         user_rx: mpsc::Receiver<ToTask>,
         max_peers: usize,
         use_checksum: bool,
@@ -187,7 +179,6 @@ impl HostTask {
             addr_map: HashMap::new(),
             accept_tx,
             user_rx,
-            user_tx,
             host_mtu: MTU_DEFAULT,
             incoming_bandwidth: 0,
             outgoing_bandwidth: 0,
@@ -213,16 +204,6 @@ impl HostTask {
     }
 
     // ── Datagram emission ─────────────────────────────────────────────────────
-
-    async fn emit(&self, peer: &PeerEntry, cmds: &[Bytes], now_ms: u32) {
-        if cmds.is_empty() {
-            return;
-        }
-        let datagram = self.make_datagram(peer, cmds, now_ms);
-        if let Err(e) = self.socket.send_to(&datagram, peer.addr).await {
-            warn!("send_to {}: {}", peer.addr, e);
-        }
-    }
 
     fn make_datagram(&self, peer: &PeerEntry, cmds: &[Bytes], now_ms: u32) -> Bytes {
         let mut buf = BytesMut::new();
@@ -330,7 +311,6 @@ impl HostTask {
         let ch = channel_count.max(1);
 
         let mut entry = PeerEntry {
-            key,
             addr,
             state: PeerState::Connecting,
             outgoing_peer_id: PEER_ID_UNASSIGNED,
@@ -339,7 +319,6 @@ impl HostTask {
             outgoing_session_id: 0xFF,
             mtu: self.host_mtu,
             window_size: WINDOW_SIZE_MAX,
-            channel_count: ch,
             throttle_interval: THROTTLE_INTERVAL_MS,
             throttle_acceleration: THROTTLE_ACCELERATION,
             throttle_deceleration: THROTTLE_DECELERATION,
@@ -354,7 +333,6 @@ impl HostTask {
             to_user: tx,
             to_user_rx: Some(rx),
             connect_reply: Some(reply),
-            is_incoming: false,
             incoming_reliable_seq: 0,
             outgoing_reliable_seq: 0,
         };
@@ -403,6 +381,11 @@ impl HostTask {
             None => return,
         };
 
+        // Compressed datagrams are not supported; drop them to avoid mis-parsing.
+        if hdr.is_compressed() {
+            return;
+        }
+
         // Resolve peer key early so we can use connectID for checksum validation.
         let peer_id = hdr.peer_id();
         let key = if peer_id == PEER_ID_UNASSIGNED {
@@ -412,6 +395,17 @@ impl HostTask {
         } else {
             None
         };
+
+        // Validate session ID for known peers (0xFF means not yet established).
+        if let Some(k) = key {
+            if let Some(peer) = self.peer(k) {
+                if peer.incoming_session_id != 0xFF
+                    && hdr.session_id() != peer.incoming_session_id
+                {
+                    return;
+                }
+            }
+        }
 
         if self.use_checksum {
             if slice.len() < 4 {
@@ -556,6 +550,32 @@ impl HostTask {
                     }
                 }
             }
+            CMD_BANDWIDTH_LIMIT => {
+                if let (Some(k), CommandBody::BandwidthLimit(bl)) = (key, cmd.body) {
+                    if let Some(p) = self.peer_mut(k) {
+                        // Update the window size based on server's bandwidth constraints.
+                        // incoming_bandwidth=0 means unlimited; outgoing_bandwidth=0 means unlimited.
+                        if bl.incoming_bandwidth != 0 || bl.outgoing_bandwidth != 0 {
+                            let throttle = if bl.incoming_bandwidth == 0 {
+                                WINDOW_SIZE_MAX
+                            } else {
+                                ((bl.incoming_bandwidth / WINDOW_SIZE_MAX) * WINDOW_SIZE_MIN)
+                                    .max(WINDOW_SIZE_MIN)
+                            };
+                            p.window_size = throttle.clamp(WINDOW_SIZE_MIN, WINDOW_SIZE_MAX);
+                        }
+                    }
+                }
+            }
+            CMD_THROTTLE_CONFIGURE => {
+                if let (Some(k), CommandBody::ThrottleConfigure(tc)) = (key, cmd.body) {
+                    if let Some(p) = self.peer_mut(k) {
+                        p.throttle_interval = tc.throttle_interval;
+                        p.throttle_acceleration = tc.throttle_acceleration;
+                        p.throttle_deceleration = tc.throttle_deceleration;
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -680,10 +700,11 @@ impl HostTask {
             .min(peer_window)
             .min(connect.window_size)
             .clamp(WINDOW_SIZE_MIN, WINDOW_SIZE_MAX);
-        let ch = (connect.channel_count as u8).max(1);
+        let ch = (connect.channel_count as u8)
+            .max(1)
+            .min(protocol::MAX_CHANNELS as u8);
 
         let mut entry = PeerEntry {
-            key,
             addr: from,
             state: PeerState::AcknowledgingConnect,
             outgoing_peer_id: connect.outgoing_peer_id,
@@ -692,7 +713,6 @@ impl HostTask {
             outgoing_session_id: out_sess,
             mtu,
             window_size,
-            channel_count: ch,
             throttle_interval: connect.throttle_interval,
             throttle_acceleration: connect.throttle_acceleration,
             throttle_deceleration: connect.throttle_deceleration,
@@ -707,7 +727,6 @@ impl HostTask {
             to_user: tx,
             to_user_rx: Some(rx),
             connect_reply: None,
-            is_incoming: true,
             incoming_reliable_seq: hdr.reliable_seq,
             outgoing_reliable_seq: 0,
         };
@@ -791,6 +810,9 @@ impl HostTask {
         peer.outgoing_session_id = vc.outgoing_session_id;
         peer.mtu = vc.mtu;
         peer.window_size = vc.window_size;
+        peer.throttle_interval = vc.throttle_interval;
+        peer.throttle_acceleration = vc.throttle_acceleration;
+        peer.throttle_deceleration = vc.throttle_deceleration;
         peer.state = PeerState::Connected;
         peer.last_receive_time = now_ms;
         peer.incoming_reliable_seq = hdr.reliable_seq;
@@ -880,6 +902,20 @@ impl HostTask {
 
         match pkt.mode {
             SendMode::Reliable => {
+                // Enforce the per-channel reliable send window.
+                {
+                    let p = match self.peer(key) { Some(p) => p, None => return };
+                    let in_flight = p.outgoing_reliable.iter()
+                        .filter(|r| r.channel_id == ch)
+                        .count();
+                    if !p.channels.get(ch as usize)
+                        .map(|c| c.reliable_window_open(in_flight))
+                        .unwrap_or(false)
+                    {
+                        return;
+                    }
+                }
+
                 let cmd_hdr = 4; // command header
                 let field_overhead = 2; // dataLength
                 let max_payload = mtu as usize - hdr_overhead - cmd_hdr - field_overhead;

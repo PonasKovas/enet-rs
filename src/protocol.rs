@@ -1,4 +1,7 @@
-/// ENet protocol constants and packet parsing/serialization.
+//! ENet protocol constants and packet parsing/serialization.
+// Protocol constants and helper methods are public API surface; many are unused
+// within this crate but document the protocol and may be used by callers.
+#![allow(dead_code)]
 use bytes::{BufMut, Bytes, BytesMut};
 
 // ── Header flags / masks ──────────────────────────────────────────────────────
@@ -235,21 +238,18 @@ pub struct DisconnectCmd {
 
 #[derive(Debug, Clone)]
 pub struct SendReliableCmd {
-    pub data_length: u16,
     pub data: Bytes,
 }
 
 #[derive(Debug, Clone)]
 pub struct SendUnreliableCmd {
     pub unreliable_seq: u16,
-    pub data_length: u16,
     pub data: Bytes,
 }
 
 #[derive(Debug, Clone)]
 pub struct SendFragmentCmd {
     pub start_seq: u16,
-    pub data_length: u16,
     pub fragment_count: u32,
     pub fragment_number: u32,
     pub total_length: u32,
@@ -260,7 +260,6 @@ pub struct SendFragmentCmd {
 #[derive(Debug, Clone)]
 pub struct SendUnsequencedCmd {
     pub unsequenced_group: u16,
-    pub data_length: u16,
     pub data: Bytes,
 }
 
@@ -399,10 +398,7 @@ impl Command {
                 }
                 let data = Bytes::copy_from_slice(&buf[..data_length]);
                 *buf = &buf[data_length..];
-                CommandBody::SendReliable(SendReliableCmd {
-                    data_length: data_length as u16,
-                    data,
-                })
+                CommandBody::SendReliable(SendReliableCmd { data })
             }
             CMD_SEND_UNRELIABLE => {
                 if buf.len() < 4 {
@@ -416,11 +412,7 @@ impl Command {
                 }
                 let data = Bytes::copy_from_slice(&buf[..data_length]);
                 *buf = &buf[data_length..];
-                CommandBody::SendUnreliable(SendUnreliableCmd {
-                    unreliable_seq,
-                    data_length: data_length as u16,
-                    data,
-                })
+                CommandBody::SendUnreliable(SendUnreliableCmd { unreliable_seq, data })
             }
             CMD_SEND_FRAGMENT | CMD_SEND_UNRELIABLE_FRAGMENT => {
                 if buf.len() < 20 {
@@ -440,7 +432,6 @@ impl Command {
                 *buf = &buf[data_length..];
                 let frag = SendFragmentCmd {
                     start_seq,
-                    data_length: data_length as u16,
                     fragment_count,
                     fragment_number,
                     total_length,
@@ -465,11 +456,7 @@ impl Command {
                 }
                 let data = Bytes::copy_from_slice(&buf[..data_length]);
                 *buf = &buf[data_length..];
-                CommandBody::SendUnsequenced(SendUnsequencedCmd {
-                    unsequenced_group,
-                    data_length: data_length as u16,
-                    data,
-                })
+                CommandBody::SendUnsequenced(SendUnsequencedCmd { unsequenced_group, data })
             }
             CMD_BANDWIDTH_LIMIT => {
                 if buf.len() < 8 {
@@ -541,17 +528,17 @@ impl Command {
             }
             CommandBody::Ping => {}
             CommandBody::SendReliable(c) => {
-                out.put_u16(c.data_length);
+                out.put_u16(c.data.len() as u16);
                 out.put_slice(&c.data);
             }
             CommandBody::SendUnreliable(c) => {
                 out.put_u16(c.unreliable_seq);
-                out.put_u16(c.data_length);
+                out.put_u16(c.data.len() as u16);
                 out.put_slice(&c.data);
             }
             CommandBody::SendFragment(c) | CommandBody::SendUnreliableFragment(c) => {
                 out.put_u16(c.start_seq);
-                out.put_u16(c.data_length);
+                out.put_u16(c.data.len() as u16);
                 out.put_u32(c.fragment_count);
                 out.put_u32(c.fragment_number);
                 out.put_u32(c.total_length);
@@ -560,7 +547,7 @@ impl Command {
             }
             CommandBody::SendUnsequenced(c) => {
                 out.put_u16(c.unsequenced_group);
-                out.put_u16(c.data_length);
+                out.put_u16(c.data.len() as u16);
                 out.put_slice(&c.data);
             }
             CommandBody::BandwidthLimit(c) => {
@@ -611,6 +598,9 @@ pub fn crc32(data: &[u8]) -> u32 {
 pub fn parse_commands(mut buf: &[u8]) -> Vec<Command> {
     let mut cmds = Vec::new();
     while !buf.is_empty() {
+        if cmds.len() >= MAX_COMMANDS_PER_PACKET {
+            break;
+        }
         match Command::parse(&mut buf) {
             Some(cmd) => cmds.push(cmd),
             None => break,
@@ -625,9 +615,4 @@ pub fn parse_commands(mut buf: &[u8]) -> Vec<Command> {
 #[inline]
 pub fn seq_gt(a: u16, b: u16) -> bool {
     (b.wrapping_sub(a) as i16) > 0
-}
-
-#[inline]
-pub fn seq_lt(a: u16, b: u16) -> bool {
-    seq_gt(b, a)
 }

@@ -1,26 +1,13 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 
 use bytes::{Bytes, BytesMut};
 
 use crate::protocol::{FREE_RELIABLE_WINDOWS, RELIABLE_WINDOW_SIZE, seq_gt};
 
-// ── Outgoing reliable tracking ────────────────────────────────────────────────
-
-#[derive(Debug)]
-pub struct OutgoingReliable {
-    pub reliable_seq: u16,
-    pub sent_time: u32,
-    pub rtt_timeout: u32,
-    pub send_attempts: u32,
-    /// Serialized command bytes (header+body, no datagram header).
-    pub packet: Bytes,
-}
-
 // ── Fragment reassembly ───────────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub struct FragmentBuffer {
-    pub total_length: usize,
     pub fragment_count: u32,
     pub received: u32,
     pub buf: Vec<u8>,
@@ -32,7 +19,6 @@ impl FragmentBuffer {
     pub fn new(total_length: usize, fragment_count: u32) -> Self {
         let mask_len = ((fragment_count as usize) + 63) / 64;
         Self {
-            total_length,
             fragment_count,
             received: 0,
             buf: vec![0u8; total_length],
@@ -75,7 +61,6 @@ pub struct Channel {
     pub outgoing_reliable_seq: u16,
     pub outgoing_unreliable_seq: u16,
     pub outgoing_unsequenced_group: u16,
-    pub used_reliable_windows: [u16; 16],
 
     // Incoming reliable
     pub incoming_reliable_seq: u16,
@@ -84,7 +69,6 @@ pub struct Channel {
 
     // Incoming unreliable
     pub incoming_unreliable_seq: u16,
-    pub incoming_unreliable_queue: VecDeque<(u16, Bytes)>,
 
     // Reliable fragment reassembly: start_seq -> buffer
     pub fragment_buffers: BTreeMap<u16, FragmentBuffer>,
@@ -96,11 +80,9 @@ impl Channel {
             outgoing_reliable_seq: 0,
             outgoing_unreliable_seq: 0,
             outgoing_unsequenced_group: 0,
-            used_reliable_windows: [0u16; 16],
             incoming_reliable_seq: 0,
             incoming_reliable_queue: BTreeMap::new(),
             incoming_unreliable_seq: 0,
-            incoming_unreliable_queue: VecDeque::new(),
             fragment_buffers: BTreeMap::new(),
         }
     }

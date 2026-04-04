@@ -155,7 +155,6 @@ impl Host {
         let task = HostTask::new(
             socket,
             accept_tx,
-            task_tx.clone(),
             task_rx,
             config.max_peers,
             config.use_checksum,
@@ -206,7 +205,6 @@ impl Host {
         let task = HostTask::new(
             socket,
             accept_tx,
-            task_tx.clone(),
             task_rx,
             1, // only one peer
             false,
