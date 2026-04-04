@@ -676,8 +676,10 @@ impl HostTask {
             now_ms,
             move |buf| {
                 buf.extend_from_slice(&assigned_id.to_be_bytes());
-                buf.extend_from_slice(&[in_s]);
+                // incomingSessionID = session server will use in its outgoing headers
                 buf.extend_from_slice(&[out_s]);
+                // outgoingSessionID = session server expects from client's headers
+                buf.extend_from_slice(&[in_s]);
                 buf.extend_from_slice(&mtu_.to_be_bytes());
                 buf.extend_from_slice(&ws_.to_be_bytes());
                 buf.extend_from_slice(&cc_.to_be_bytes());

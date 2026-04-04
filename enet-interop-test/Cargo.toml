@@ -1,0 +1,15 @@
+[package]
+name = "enet-interop-test"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "enet-interop-test"
+path = "src/main.rs"
+
+[dependencies]
+enet-rs = { path = ".." }
+tokio = { version = "1", features = ["full"] }
+
+[build-dependencies]
+cc = "1"
