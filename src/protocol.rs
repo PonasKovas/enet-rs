@@ -41,6 +41,7 @@ pub const MAX_CHANNELS: u32 = 255;
 pub const MAX_PEERS: usize = 4095;
 pub const MAX_COMMANDS_PER_PACKET: usize = 32;
 pub const MAX_FRAGMENT_COUNT: u32 = 1_048_576;
+pub const MAX_PACKET_SIZE: usize = 32 * 1024 * 1024; // 32 MiB – hard cap on reassembled size
 pub const RELIABLE_WINDOW_SIZE: u16 = 4096;
 pub const RELIABLE_WINDOWS: u16 = 16;
 pub const FREE_RELIABLE_WINDOWS: u16 = 8;

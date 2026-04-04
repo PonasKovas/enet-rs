@@ -145,8 +145,11 @@ impl Channel {
             }
             out
         } else if seq_gt(expected, seq) {
-            // Future out-of-order packet — buffer it
-            self.incoming_reliable_queue.insert(seq, data);
+            // Buffer only if within the receive window (FREE_RELIABLE_WINDOWS * RELIABLE_WINDOW_SIZE = 32 768)
+            let window: u16 = FREE_RELIABLE_WINDOWS * RELIABLE_WINDOW_SIZE;
+            if seq.wrapping_sub(expected) <= window {
+                self.incoming_reliable_queue.insert(seq, data);
+            }
             vec![]
         } else {
             // Old duplicate — discard
