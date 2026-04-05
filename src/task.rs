@@ -28,6 +28,8 @@ use crate::{
     },
 };
 
+type ConnectReplySender = tokio::sync::oneshot::Sender<Result<(PeerKey, mpsc::Receiver<Packet>), Error>>;
+
 // ── Messages: user ↔ task ─────────────────────────────────────────────────────
 
 pub enum ToTask {
@@ -44,7 +46,7 @@ pub enum ToTask {
         addr: SocketAddr,
         channel_count: u8,
         data: u32,
-        reply: tokio::sync::oneshot::Sender<Result<(PeerKey, mpsc::Receiver<Packet>), Error>>,
+        reply: ConnectReplySender,
     },
 }
 
@@ -110,9 +112,7 @@ struct PeerEntry {
     to_user_rx: Option<mpsc::Receiver<Packet>>,
 
     /// Client-side: reply channel for Host::connect().
-    connect_reply: Option<
-        tokio::sync::oneshot::Sender<Result<(PeerKey, mpsc::Receiver<Packet>), Error>>,
-    >,
+    connect_reply: Option<ConnectReplySender>,
     // Connection-level sequence number tracking
     incoming_reliable_seq: u16,
     outgoing_reliable_seq: u16,
@@ -122,7 +122,7 @@ impl PeerEntry {
     fn update_rtt(&mut self, sample: u32) {
         if !self.rtt_initialized {
             self.rtt = sample;
-            self.rtt_var = (sample + 1) / 2;
+            self.rtt_var = sample.div_ceil(2);
             self.rtt_initialized = true;
         } else {
             self.rtt_var = self.rtt_var.saturating_sub(self.rtt_var / 4);
@@ -341,7 +341,6 @@ impl HostTask {
             outgoing_reliable_seq: 0,
         };
 
-        let connect_id = connect_id;
         let mtu = self.host_mtu;
         let ib = self.incoming_bandwidth;
         let ob = self.outgoing_bandwidth;
@@ -940,7 +939,7 @@ impl HostTask {
                     let frag_fields = 20; // startSeq+dataLen+count+num+total+offset
                     let frag_payload = mtu as usize - hdr_overhead - cmd_hdr - frag_fields;
                     let total = pkt.data.len();
-                    let frag_count = (total + frag_payload - 1) / frag_payload;
+                    let frag_count = total.div_ceil(frag_payload);
                     let data = pkt.data;
 
                     let start_seq = {
@@ -1021,7 +1020,7 @@ impl HostTask {
                     let frag_fields = 20;
                     let frag_payload = mtu as usize - hdr_overhead - cmd_hdr - frag_fields;
                     let total = pkt.data.len();
-                    let frag_count = (total + frag_payload - 1) / frag_payload;
+                    let frag_count = total.div_ceil(frag_payload);
                     let data = pkt.data;
                     // start_seq is the unreliable sequence of the first fragment (grouping key).
                     let (start_seq, reliable_seq) = {
@@ -1254,11 +1253,9 @@ impl HostTask {
                         }
                         Some(ToTask::Connect { addr, channel_count, data, reply }) => {
                             let now_ms = self.now_ms();
-                            match self.begin_connect(addr, channel_count, data, now_ms, reply) {
-                                Some((key, cmd)) => {
-                                    self.emit_by_key(key, &[cmd], now_ms).await;
-                                }
-                                None => {} // reply already sent Err
+                            if let Some((key, cmd)) = self.begin_connect(addr, channel_count, data, now_ms, reply) {
+                                // reply already sent Err if None
+                                self.emit_by_key(key, &[cmd], now_ms).await;
                             }
                         }
                     }

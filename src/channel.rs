@@ -17,7 +17,7 @@ pub struct FragmentBuffer {
 
 impl FragmentBuffer {
     pub fn new(total_length: usize, fragment_count: u32) -> Self {
-        let mask_len = ((fragment_count as usize) + 63) / 64;
+        let mask_len = (fragment_count as usize).div_ceil(64);
         Self {
             fragment_count,
             received: 0,
