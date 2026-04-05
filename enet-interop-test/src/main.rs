@@ -65,7 +65,7 @@ fn test_rust_server_c_client(rt: &tokio::runtime::Runtime) {
 
         // Accept one peer, receive one packet, echo it back, then let the task end.
         if let Some(mut peer) = server.accept().await {
-            if let Some(pkt) = peer.recv().await {
+            if let Ok(pkt) = peer.recv().await {
                 let reply = Packet::reliable(pkt.data.clone(), pkt.channel);
                 peer.send_packet(reply).await.unwrap();
                 // Give the host task time to flush before we drop everything.

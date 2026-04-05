@@ -13,9 +13,14 @@
 //!
 //!     while let Some(mut peer) = host.accept().await {
 //!         tokio::spawn(async move {
-//!             while let Some(pkt) = peer.recv().await {
-//!                 println!("ch{}: {} bytes", pkt.channel, pkt.data.len());
-//!                 peer.send_packet(Packet::reliable(b"pong".as_ref(), 0)).await.ok();
+//!             loop {
+//!                 match peer.recv().await {
+//!                     Ok(pkt) => {
+//!                         println!("ch{}: {} bytes", pkt.channel, pkt.data.len());
+//!                         peer.send_packet(Packet::reliable(b"pong".as_ref(), 0)).await.ok();
+//!                     }
+//!                     Err(e) => { println!("peer gone: {e}"); break; }
+//!                 }
 //!             }
 //!         });
 //!     }
@@ -32,7 +37,7 @@
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let mut peer = Host::connect("127.0.0.1:7777", 2).await?;
 //!     peer.send_packet(Packet::reliable(b"ping".as_ref(), 0)).await?;
-//!     if let Some(pkt) = peer.recv().await {
+//!     if let Ok(pkt) = peer.recv().await {
 //!         println!("reply: {:?}", pkt.data);
 //!     }
 //!     Ok(())
@@ -53,7 +58,7 @@ use std::{net::ToSocketAddrs, sync::Arc, time::Duration};
 use bytes::Bytes;
 use tokio::{net::UdpSocket, sync::mpsc, time::timeout};
 
-use task::{HostTask, ToTask};
+use task::{HostTask, PeerMsg, ToTask};
 
 // ── Packet ────────────────────────────────────────────────────────────────────
 
@@ -78,6 +83,7 @@ pub struct Packet {
     /// Delivery semantics.
     pub mode: SendMode,
 }
+
 
 impl Packet {
     /// Create a reliable packet.
@@ -133,7 +139,7 @@ impl Default for HostConfig {
 /// interacts via async channels — no manual event loops required.
 pub struct Host {
     /// Receives newly accepted [`Peer`] connections.
-    accept_rx: mpsc::Receiver<(PeerKey, mpsc::Receiver<Packet>)>,
+    accept_rx: mpsc::Receiver<(PeerKey, mpsc::Receiver<PeerMsg>)>,
     /// Sends control messages to the background task.
     task_tx: mpsc::Sender<ToTask>,
 }

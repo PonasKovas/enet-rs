@@ -121,12 +121,6 @@ impl Channel {
         self.outgoing_unsequenced_group
     }
 
-    /// Returns true if the reliable window is open for sending.
-    #[allow(dead_code)]
-    pub fn reliable_window_open(&self, in_flight: usize) -> bool {
-        in_flight < (FREE_RELIABLE_WINDOWS as usize * RELIABLE_WINDOW_SIZE as usize)
-    }
-
     /// Receive a reliable in-order delivery. Returns in-order messages that are now deliverable.
     pub fn receive_reliable(&mut self, seq: u16, data: Bytes) -> Vec<Bytes> {
         let expected = self.incoming_reliable_seq.wrapping_add(1);

@@ -22,7 +22,7 @@ async fn test_reliable_echo() {
     tokio::spawn(async move {
         while let Some(mut peer) = server.accept().await {
             tokio::spawn(async move {
-                while let Some(pkt) = peer.recv().await {
+                while let Ok(pkt) = peer.recv().await {
                     let reply = Packet::reliable(pkt.data.clone(), pkt.channel);
                     peer.send_packet(reply).await.unwrap();
                 }
@@ -57,7 +57,7 @@ async fn test_unreliable_send() {
 
     tokio::spawn(async move {
         if let Some(mut peer) = server.accept().await {
-            while let Some(pkt) = peer.recv().await {
+            while let Ok(pkt) = peer.recv().await {
                 let reply = Packet::unreliable(pkt.data, pkt.channel);
                 peer.send_packet(reply).await.unwrap();
             }
@@ -90,7 +90,7 @@ async fn test_unsequenced_send() {
 
     tokio::spawn(async move {
         if let Some(mut peer) = server.accept().await {
-            while let Some(pkt) = peer.recv().await {
+            while let Ok(pkt) = peer.recv().await {
                 let reply = Packet::unsequenced(pkt.data);
                 peer.send_packet(reply).await.unwrap();
             }
@@ -122,7 +122,7 @@ async fn test_reliable_ordering() {
 
     tokio::spawn(async move {
         if let Some(mut peer) = server.accept().await {
-            while let Some(pkt) = peer.recv().await {
+            while let Ok(pkt) = peer.recv().await {
                 peer.send_packet(Packet::reliable(pkt.data, 0)).await.unwrap();
             }
         }
@@ -156,7 +156,7 @@ async fn test_large_reliable_fragmented() {
 
     tokio::spawn(async move {
         if let Some(mut peer) = server.accept().await {
-            while let Some(pkt) = peer.recv().await {
+            while let Ok(pkt) = peer.recv().await {
                 peer.send_packet(Packet::reliable(pkt.data, 0)).await.unwrap();
             }
         }
@@ -190,7 +190,7 @@ async fn test_sink_stream_api() {
 
     tokio::spawn(async move {
         if let Some(mut peer) = server.accept().await {
-            while let Some(pkt) = peer.next().await {
+            while let Some(Ok(pkt)) = peer.next().await {
                 peer.send(Packet::reliable(pkt.data, 0)).await.unwrap();
             }
         }
@@ -202,6 +202,7 @@ async fn test_sink_stream_api() {
     let reply = timeout(Duration::from_secs(5), peer.next())
         .await
         .expect("timeout")
+        .expect("stream ended")
         .expect("disconnected");
 
     assert_eq!(reply.data.as_ref(), b"sink api");
@@ -218,7 +219,7 @@ async fn test_split_peer() {
 
     tokio::spawn(async move {
         if let Some(mut peer) = server.accept().await {
-            while let Some(pkt) = peer.recv().await {
+            while let Ok(pkt) = peer.recv().await {
                 peer.send_packet(Packet::reliable(pkt.data, 0)).await.unwrap();
             }
         }
@@ -229,9 +230,10 @@ async fn test_split_peer() {
 
     sender.send_packet(Packet::reliable(b"split works".as_ref(), 0)).await.unwrap();
 
-    let reply: Packet = timeout(Duration::from_secs(5), receiver.rx.recv())
+    let reply = timeout(Duration::from_secs(5), receiver.rx.recv())
         .await
         .expect("timeout")
+        .expect("channel closed")
         .expect("disconnected");
 
     assert_eq!(reply.data.as_ref(), b"split works");
@@ -249,7 +251,7 @@ async fn test_multiple_clients() {
     tokio::spawn(async move {
         while let Some(mut peer) = server.accept().await {
             tokio::spawn(async move {
-                while let Some(pkt) = peer.recv().await {
+                while let Ok(pkt) = peer.recv().await {
                     peer.send_packet(Packet::reliable(pkt.data, 0)).await.unwrap();
                 }
             });

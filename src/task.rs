@@ -42,7 +42,10 @@ const MAX_FRAGMENT_BYTES_PER_PEER: usize = 16 * 1024 * 1024; // 16 MiB
 /// Maximum number of reliable packets queued in `pending_send` when the window is full.
 const MAX_PENDING_SEND: usize = 1024;
 
-type ConnectReplySender = tokio::sync::oneshot::Sender<Result<(PeerKey, mpsc::Receiver<Packet>), Error>>;
+/// Item type sent through the per-peer delivery channel.
+/// `Ok(pkt)` = data packet; `Err(data)` = disconnect event with optional app data.
+pub(crate) type PeerMsg = Result<Packet, Option<u32>>;
+type ConnectReplySender = tokio::sync::oneshot::Sender<Result<(PeerKey, mpsc::Receiver<PeerMsg>), Error>>;
 
 // ── Messages: user ↔ task ─────────────────────────────────────────────────────
 
@@ -141,9 +144,9 @@ struct PeerEntry {
     rtt_at_throttle_epoch: u32,
 
     /// Delivers decoded packets to the user-facing Peer.
-    to_user: mpsc::Sender<Packet>,
+    to_user: mpsc::Sender<PeerMsg>,
     /// Held until the connection is established, then given to the user.
-    to_user_rx: Option<mpsc::Receiver<Packet>>,
+    to_user_rx: Option<mpsc::Receiver<PeerMsg>>,
 
     /// Client-side: reply channel for Host::connect().
     connect_reply: Option<ConnectReplySender>,
@@ -193,7 +196,7 @@ pub(crate) struct HostTask {
     peers: Vec<Option<PeerEntry>>,
     addr_map: HashMap<SocketAddr, PeerKey>,
 
-    accept_tx: mpsc::Sender<(PeerKey, mpsc::Receiver<Packet>)>,
+    accept_tx: mpsc::Sender<(PeerKey, mpsc::Receiver<PeerMsg>)>,
     user_rx: mpsc::Receiver<ToTask>,
 
     host_mtu: u32,
@@ -208,7 +211,7 @@ pub(crate) struct HostTask {
 impl HostTask {
     pub fn new(
         socket: std::sync::Arc<UdpSocket>,
-        accept_tx: mpsc::Sender<(PeerKey, mpsc::Receiver<Packet>)>,
+        accept_tx: mpsc::Sender<(PeerKey, mpsc::Receiver<PeerMsg>)>,
         user_rx: mpsc::Receiver<ToTask>,
         max_peers: usize,
         use_checksum: bool,
@@ -278,10 +281,7 @@ impl HostTask {
         if cmds.is_empty() {
             return;
         }
-        let peer = match self.peer(key) {
-            Some(p) => p,
-            None => return,
-        };
+        let Some(peer) = self.peer(key) else { return };
         let datagram = self.make_datagram(peer, cmds, now_ms);
         let addr = peer.addr;
         if let Err(e) = self.socket.send_to(&datagram, addr).await {
@@ -347,7 +347,7 @@ impl HostTask {
         channel_count: u8,
         user_data: u32,
         now_ms: u32,
-        reply: tokio::sync::oneshot::Sender<Result<(PeerKey, mpsc::Receiver<Packet>), Error>>,
+        reply: ConnectReplySender,
     ) -> Option<(PeerKey, Bytes)> {
         let slot = self.alloc_slot()?;
         let key = PeerKey(slot);
@@ -389,11 +389,11 @@ impl HostTask {
             connect_seq: 0,
         };
 
-        let mtu = self.host_mtu;
-        let ib = self.incoming_bandwidth;
-        let ob = self.outgoing_bandwidth;
-        let cc = ch as u32;
-        let key_idx = key.0 as u16;
+        let host_mtu = self.host_mtu;
+        let incoming_bandwidth = self.incoming_bandwidth;
+        let outgoing_bandwidth = self.outgoing_bandwidth;
+        let channel_count_u32 = ch as u32;
+        let peer_id_wire = key.0 as u16;
 
         let cmd = Self::make_reliable(
             &mut entry,
@@ -402,14 +402,14 @@ impl HostTask {
             0,
             now_ms,
             move |buf| {
-                buf.extend_from_slice(&key_idx.to_be_bytes()); // outgoingPeerID
+                buf.extend_from_slice(&peer_id_wire.to_be_bytes()); // outgoingPeerID
                 buf.extend_from_slice(&[0xFF]); // incomingSessionID: request fresh
                 buf.extend_from_slice(&[0xFF]); // outgoingSessionID: request fresh
-                buf.extend_from_slice(&mtu.to_be_bytes());
+                buf.extend_from_slice(&host_mtu.to_be_bytes());
                 buf.extend_from_slice(&WINDOW_SIZE_MAX.to_be_bytes());
-                buf.extend_from_slice(&cc.to_be_bytes());
-                buf.extend_from_slice(&ib.to_be_bytes());
-                buf.extend_from_slice(&ob.to_be_bytes());
+                buf.extend_from_slice(&channel_count_u32.to_be_bytes());
+                buf.extend_from_slice(&incoming_bandwidth.to_be_bytes());
+                buf.extend_from_slice(&outgoing_bandwidth.to_be_bytes());
                 buf.extend_from_slice(&THROTTLE_INTERVAL_MS.to_be_bytes());
                 buf.extend_from_slice(&THROTTLE_ACCELERATION.to_be_bytes());
                 buf.extend_from_slice(&THROTTLE_DECELERATION.to_be_bytes());
@@ -488,7 +488,7 @@ impl HostTask {
         let mut pending_acks: Vec<Bytes> = Vec::new();
 
         for cmd in cmds {
-            self.on_command(key, &hdr, sent_time, cmd, from, now_ms, &mut pending_acks)
+            self.on_command(key, sent_time, cmd, from, now_ms, &mut pending_acks)
                 .await;
         }
 
@@ -505,14 +505,29 @@ impl HostTask {
     async fn on_command(
         &mut self,
         key: Option<PeerKey>,
-        _hdr: &ProtocolHeader,
         sent_time: Option<u16>,
         cmd: Command,
         from: SocketAddr,
         now_ms: u32,
         pending_acks: &mut Vec<Bytes>,
     ) {
-        match cmd.header.command_type() {
+        // Cache header fields before `cmd` is partially moved by the match below.
+        let cmd_type   = cmd.header.command_type();
+        let hdr_has_ack = cmd.header.has_ack_flag();
+        let hdr_channel = cmd.header.channel_id;
+        let hdr_seq     = cmd.header.reliable_seq;
+
+        // ACK any reliable command uniformly, with two exceptions handled inline:
+        //   CMD_CONNECT    – ACK is bundled with VERIFY_CONNECT inside on_connect.
+        //   CMD_DISCONNECT – ACK must be emitted *before* remove_peer (timing-critical).
+        //   CMD_ACKNOWLEDGE – never ACK an ACK.
+        if hdr_has_ack && !matches!(cmd_type, CMD_CONNECT | CMD_DISCONNECT | CMD_ACKNOWLEDGE) {
+            if let (Some(_), Some(st)) = (key, sent_time) {
+                pending_acks.push(Self::ack(hdr_channel, hdr_seq, st));
+            }
+        }
+
+        match cmd_type {
             CMD_CONNECT => {
                 if let CommandBody::Connect(c) = cmd.body {
                     // on_connect emits its own ACK bundled with VERIFY_CONNECT.
@@ -521,24 +536,26 @@ impl HostTask {
             }
             CMD_VERIFY_CONNECT => {
                 if let (Some(k), CommandBody::VerifyConnect(vc)) = (key, cmd.body) {
-                    self.on_verify_connect(k, vc, cmd.header, sent_time, now_ms, pending_acks)
-                        .await;
+                    self.on_verify_connect(k, vc, cmd.header, now_ms).await;
                 }
             }
             CMD_ACKNOWLEDGE => {
                 if let (Some(k), CommandBody::Acknowledge(ack)) = (key, cmd.body) {
-                    self.on_ack(k, cmd.header.channel_id, ack, now_ms).await;
+                    self.on_ack(k, hdr_channel, ack, now_ms).await;
                 }
             }
             CMD_DISCONNECT => {
-                if let Some(k) = key {
-                    let graceful = cmd.header.has_ack_flag();
-                    if graceful {
+                if let (Some(k), CommandBody::Disconnect(d)) = (key, cmd.body) {
+                    if hdr_has_ack {
                         // Emit ACK immediately before remove_peer destroys the peer state.
                         if let Some(st) = sent_time {
-                            let a = Self::ack(cmd.header.channel_id, cmd.header.reliable_seq, st);
+                            let a = Self::ack(hdr_channel, hdr_seq, st);
                             self.emit_by_key(k, &[a], now_ms).await;
                         }
+                    }
+                    // Notify the application of the disconnect reason before dropping the channel.
+                    if let Some(p) = self.peer(k) {
+                        let _ = p.to_user.try_send(Err(Some(d.data)));
                     }
                     self.remove_peer(k);
                 }
@@ -548,22 +565,14 @@ impl HostTask {
                     if let Some(p) = self.peer_mut(k) {
                         p.last_receive_time = now_ms;
                     }
-                    if cmd.header.has_ack_flag() {
-                        if let Some(st) = sent_time {
-                            pending_acks.push(Self::ack(cmd.header.channel_id, cmd.header.reliable_seq, st));
-                        }
-                    }
                 }
             }
             CMD_SEND_RELIABLE => {
                 if let (Some(k), CommandBody::SendReliable(sr)) = (key, cmd.body) {
-                    let ch = cmd.header.channel_id;
-                    let seq = cmd.header.reliable_seq;
-                    if let Some(st) = sent_time {
-                        pending_acks.push(Self::ack(ch, seq, st));
-                    }
+                    let ch = hdr_channel;
+                    let seq = hdr_seq;
                     let ready = {
-                        let p = match self.peer_mut(k) { Some(p) => p, None => return };
+                        let Some(p) = self.peer_mut(k) else { return };
                         p.last_receive_time = now_ms;
                         if ch as usize >= p.channels.len() { return; }
                         p.channels[ch as usize].receive_reliable(seq, sr.data)
@@ -580,7 +589,7 @@ impl HostTask {
                     // Drop if this unreliable belongs to an older reliable epoch than we've received.
                     let reliable_seq_in_cmd = cmd.header.reliable_seq;
                     let accepted = {
-                        let p = match self.peer_mut(k) { Some(p) => p, None => return };
+                        let Some(p) = self.peer_mut(k) else { return };
                         p.last_receive_time = now_ms;
                         if ch as usize >= p.channels.len() { return; }
                         if protocol::seq_lt(reliable_seq_in_cmd, p.channels[ch as usize].incoming_reliable_seq) {
@@ -595,11 +604,7 @@ impl HostTask {
             }
             CMD_SEND_FRAGMENT => {
                 if let (Some(k), CommandBody::SendFragment(sf)) = (key, cmd.body) {
-                    let ch = cmd.header.channel_id;
-                    let seq = cmd.header.reliable_seq;
-                    if let Some(st) = sent_time {
-                        pending_acks.push(Self::ack(ch, seq, st));
-                    }
+                    let ch = hdr_channel;
                     self.on_fragment(k, ch, sf, true, now_ms);
                 }
             }
@@ -612,7 +617,7 @@ impl HostTask {
             CMD_SEND_UNSEQUENCED => {
                 if let (Some(k), CommandBody::SendUnsequenced(su)) = (key, cmd.body) {
                     let accepted = {
-                        let p = match self.peer_mut(k) { Some(p) => p, None => return };
+                        let Some(p) = self.peer_mut(k) else { return };
                         p.last_receive_time = now_ms;
                         p.unsequenced_window.check_and_set(su.unsequenced_group)
                     };
@@ -686,7 +691,7 @@ impl HostTask {
         }
 
         let ready = {
-            let p = match self.peer_mut(key) { Some(p) => p, None => return };
+            let Some(p) = self.peer_mut(key) else { return };
             p.last_receive_time = now_ms;
             if ch as usize >= p.channels.len() { return; }
 
@@ -767,7 +772,7 @@ impl HostTask {
 
     fn deliver(&self, key: PeerKey, pkt: Packet) {
         if let Some(p) = self.peer(key) {
-            let _ = p.to_user.try_send(pkt);
+            let _ = p.to_user.try_send(Ok(pkt));
         }
     }
 
@@ -871,18 +876,13 @@ impl HostTask {
         let ack_opt = sent_time.map(|st| Self::ack(CHANNEL_ID_CONNECTION, hdr.reliable_seq, st));
 
         // VERIFY_CONNECT
-        let assigned_id = key.0 as u16;
-        let mtu_ = mtu;
-        let ws_ = window_size;
-        let cc_ = ch as u32;
-        let ib_ = self.incoming_bandwidth;
-        let ob_ = self.outgoing_bandwidth;
-        let ti_ = entry.throttle_interval;
-        let ta_ = entry.throttle_acceleration;
-        let td_ = entry.throttle_deceleration;
-        let cid_ = connect.connect_id;
-        let in_s = in_sess;
-        let out_s = out_sess;
+        let peer_id_wire = key.0 as u16;
+        let host_ib = self.incoming_bandwidth;
+        let host_ob = self.outgoing_bandwidth;
+        let throttle_interval = entry.throttle_interval;
+        let throttle_acceleration = entry.throttle_acceleration;
+        let throttle_deceleration = entry.throttle_deceleration;
+        let connect_id = connect.connect_id;
 
         let verify = Self::make_reliable(
             &mut entry,
@@ -891,20 +891,20 @@ impl HostTask {
             0,
             now_ms,
             move |buf| {
-                buf.extend_from_slice(&assigned_id.to_be_bytes());
+                buf.extend_from_slice(&peer_id_wire.to_be_bytes());
                 // incomingSessionID = session server will use in its outgoing headers
-                buf.extend_from_slice(&[out_s]);
+                buf.extend_from_slice(&[out_sess]);
                 // outgoingSessionID = session server expects from client's headers
-                buf.extend_from_slice(&[in_s]);
-                buf.extend_from_slice(&mtu_.to_be_bytes());
-                buf.extend_from_slice(&ws_.to_be_bytes());
-                buf.extend_from_slice(&cc_.to_be_bytes());
-                buf.extend_from_slice(&ib_.to_be_bytes());
-                buf.extend_from_slice(&ob_.to_be_bytes());
-                buf.extend_from_slice(&ti_.to_be_bytes());
-                buf.extend_from_slice(&ta_.to_be_bytes());
-                buf.extend_from_slice(&td_.to_be_bytes());
-                buf.extend_from_slice(&cid_.to_be_bytes());
+                buf.extend_from_slice(&[in_sess]);
+                buf.extend_from_slice(&mtu.to_be_bytes());
+                buf.extend_from_slice(&window_size.to_be_bytes());
+                buf.extend_from_slice(&(ch as u32).to_be_bytes());
+                buf.extend_from_slice(&host_ib.to_be_bytes());
+                buf.extend_from_slice(&host_ob.to_be_bytes());
+                buf.extend_from_slice(&throttle_interval.to_be_bytes());
+                buf.extend_from_slice(&throttle_acceleration.to_be_bytes());
+                buf.extend_from_slice(&throttle_deceleration.to_be_bytes());
+                buf.extend_from_slice(&connect_id.to_be_bytes());
             },
         );
 
@@ -931,16 +931,11 @@ impl HostTask {
         key: PeerKey,
         vc: VerifyConnectCmd,
         hdr: CommandHeader,
-        sent_time: Option<u16>,
         now_ms: u32,
-        pending_acks: &mut Vec<Bytes>,
     ) {
         // Read host_mtu before borrowing the peer (borrow-checker).
         let host_mtu = self.host_mtu;
-        let peer = match self.peer_mut(key) {
-            Some(p) => p,
-            None => return,
-        };
+        let Some(peer) = self.peer_mut(key) else { return };
         if peer.state != PeerState::Connecting || vc.connect_id != peer.connect_id {
             return;
         }
@@ -961,10 +956,6 @@ impl HostTask {
         let rx = peer.to_user_rx.take();
         let reply = peer.connect_reply.take();
 
-        // ACK for VERIFY_CONNECT (batched with any other ACKs from this datagram).
-        let st = sent_time.unwrap_or(0);
-        pending_acks.push(Self::ack(CHANNEL_ID_CONNECTION, hdr.reliable_seq, st));
-
         // Remove CONNECT from the outstanding queue (VERIFY_CONNECT implicitly acks it).
         if let Some(p) = self.peer_mut(key) {
             let connect_seq = p.connect_seq;
@@ -980,10 +971,7 @@ impl HostTask {
 
     async fn on_ack(&mut self, key: PeerKey, channel_id: u8, ack: AcknowledgeCmd, now_ms: u32) {
         let (was_acking_connect, rx_for_user, should_disconnect) = {
-            let peer = match self.peer_mut(key) {
-                Some(p) => p,
-                None => return,
-            };
+            let Some(peer) = self.peer_mut(key) else { return };
             peer.last_receive_time = now_ms;
 
             // Reconstruct full 32-bit sent time
@@ -1085,7 +1073,7 @@ impl HostTask {
                 // Counting in-flight packets is wrong under wrap-around: seq 65537 collides with
                 // seq 1 if the count check passes but the seq-diff check would not.
                 {
-                    let p = match self.peer_mut(key) { Some(p) => p, None => return };
+                    let Some(p) = self.peer_mut(key) else { return };
                     if ch as usize >= p.channels.len() { return; }
 
                     let next_seq = p.channels[ch as usize].outgoing_reliable_seq.wrapping_add(1);
@@ -1158,23 +1146,19 @@ impl HostTask {
                             p.channels[ch as usize].next_reliable_seq()
                         };
 
-                        let s_seq = start_seq;
-                        let fc = frag_count as u32;
-                        let fi = i as u32;
-                        let tot = total as u32;
-                        let fo = offset as u32;
-                        let frag2 = frag.clone();
-
                         let p = self.peer_mut(key).unwrap();
                         let timeout = p.initial_rtt_timeout();
-                        let cmd = encode_command(CMD_SEND_FRAGMENT, COMMAND_FLAG_ACKNOWLEDGE, ch, seq, move |buf| {
-                            buf.extend_from_slice(&s_seq.to_be_bytes());
-                            buf.extend_from_slice(&frag_len.to_be_bytes());
-                            buf.extend_from_slice(&fc.to_be_bytes());
-                            buf.extend_from_slice(&fi.to_be_bytes());
-                            buf.extend_from_slice(&tot.to_be_bytes());
-                            buf.extend_from_slice(&fo.to_be_bytes());
-                            buf.extend_from_slice(&frag2);
+                        let cmd = encode_command(CMD_SEND_FRAGMENT, COMMAND_FLAG_ACKNOWLEDGE, ch, seq, {
+                            let frag = frag.clone();
+                            move |buf| {
+                                buf.extend_from_slice(&start_seq.to_be_bytes());
+                                buf.extend_from_slice(&frag_len.to_be_bytes());
+                                buf.extend_from_slice(&(frag_count as u32).to_be_bytes());
+                                buf.extend_from_slice(&(i as u32).to_be_bytes());
+                                buf.extend_from_slice(&(total as u32).to_be_bytes());
+                                buf.extend_from_slice(&(offset as u32).to_be_bytes());
+                                buf.extend_from_slice(&frag);
+                            }
                         });
                         p.outgoing_reliable.insert((ch, seq), OutstandingReliable {
                             reliable_seq: seq,
@@ -1233,22 +1217,16 @@ impl HostTask {
                         let end = (offset + frag_payload).min(total);
                         let frag = data.slice(offset..end);
                         let frag_len = frag.len() as u16;
-                        let s_seq = start_seq;
-                        let fc = frag_count as u32;
-                        let fi = i as u32;
-                        let tot = total as u32;
-                        let fo = offset as u32;
-                        let frag2 = frag.clone();
                         // Header carries the channel reliable seq; payload start_seq is the
                         // first fragment's unreliable seq used as the assembly group key.
                         let cmd = encode_command(CMD_SEND_UNRELIABLE_FRAGMENT, 0, ch, reliable_seq, move |buf| {
-                            buf.extend_from_slice(&s_seq.to_be_bytes());
+                            buf.extend_from_slice(&start_seq.to_be_bytes());
                             buf.extend_from_slice(&frag_len.to_be_bytes());
-                            buf.extend_from_slice(&fc.to_be_bytes());
-                            buf.extend_from_slice(&fi.to_be_bytes());
-                            buf.extend_from_slice(&tot.to_be_bytes());
-                            buf.extend_from_slice(&fo.to_be_bytes());
-                            buf.extend_from_slice(&frag2);
+                            buf.extend_from_slice(&(frag_count as u32).to_be_bytes());
+                            buf.extend_from_slice(&(i as u32).to_be_bytes());
+                            buf.extend_from_slice(&(total as u32).to_be_bytes());
+                            buf.extend_from_slice(&(offset as u32).to_be_bytes());
+                            buf.extend_from_slice(&frag);
                         });
                         cmds.push(cmd);
                     }
@@ -1316,7 +1294,7 @@ impl HostTask {
     async fn send_disconnect(&mut self, key: PeerKey, data: u32, now_ms: u32) {
         // If reliable packets are still queued, defer until the queue drains.
         {
-            let p = match self.peer_mut(key) { Some(p) => p, None => return };
+            let Some(p) = self.peer_mut(key) else { return };
             // Idempotent: ignore if already in the disconnect process.
             if matches!(p.state, PeerState::Disconnecting | PeerState::DisconnectLater(_)) {
                 return;
@@ -1328,7 +1306,7 @@ impl HostTask {
             p.state = PeerState::Disconnecting;
         }
         let cmd = {
-            let p = match self.peer_mut(key) { Some(p) => p, None => return };
+            let Some(p) = self.peer_mut(key) else { return };
             Self::make_reliable(p, CHANNEL_ID_CONNECTION, CMD_DISCONNECT, 0, now_ms, move |buf| {
                 buf.extend_from_slice(&data.to_be_bytes());
             })
@@ -1419,7 +1397,7 @@ impl HostTask {
 
         for key in connected_keys {
             let cmd = {
-                let p = match self.peer_mut(key) { Some(p) => p, None => continue };
+                let Some(p) = self.peer_mut(key) else { continue };
                 Self::make_reliable(p, CHANNEL_ID_CONNECTION, CMD_BANDWIDTH_LIMIT, 0, now_ms, move |buf| {
                     buf.extend_from_slice(&ib.to_be_bytes());
                     buf.extend_from_slice(&ob.to_be_bytes());
@@ -1431,7 +1409,7 @@ impl HostTask {
 
     async fn service_one(&mut self, key: PeerKey, now_ms: u32) {
         let (timed_out, retransmits, ping_needed, disconnect_later) = {
-            let p = match self.peer_mut(key) { Some(p) => p, None => return };
+            let Some(p) = self.peer_mut(key) else { return };
 
             let mut timed_out = false;
             let mut retransmits = Vec::new();
@@ -1470,6 +1448,10 @@ impl HostTask {
         };
 
         if timed_out {
+            // Notify the application of the unclean disconnect (no data available).
+            if let Some(p) = self.peer(key) {
+                let _ = p.to_user.try_send(Err(None));
+            }
             self.remove_peer(key);
             return;
         }
@@ -1484,8 +1466,10 @@ impl HostTask {
         if ping_needed {
             let ping = {
                 let p = self.peer_mut(key).unwrap();
-                let seq = p.next_connect_seq();
-                encode_command(CMD_PING, COMMAND_FLAG_ACKNOWLEDGE, CHANNEL_ID_CONNECTION, seq, |_| {})
+                // Track ping in outgoing_reliable so an unresponsive peer is detected:
+                // if the ACK never arrives the ping retransmit logic will eventually
+                // trigger a timeout, just like unacknowledged data would.
+                Self::make_reliable(p, CHANNEL_ID_CONNECTION, CMD_PING, 0, now_ms, |_| {})
             };
             self.emit_by_key(key, &[ping], now_ms).await;
         }
@@ -1493,11 +1477,11 @@ impl HostTask {
         if let Some(data) = disconnect_later {
             // Queue is now empty — proceed with the actual disconnect.
             {
-                let p = match self.peer_mut(key) { Some(p) => p, None => return };
+                let Some(p) = self.peer_mut(key) else { return };
                 p.state = PeerState::Disconnecting;
             }
             let cmd = {
-                let p = match self.peer_mut(key) { Some(p) => p, None => return };
+                let Some(p) = self.peer_mut(key) else { return };
                 Self::make_reliable(p, CHANNEL_ID_CONNECTION, CMD_DISCONNECT, 0, now_ms, move |buf| {
                     buf.extend_from_slice(&data.to_be_bytes());
                 })

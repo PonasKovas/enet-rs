@@ -8,8 +8,8 @@ pub enum Error {
     #[error("connection timed out")]
     TimedOut,
 
-    #[error("peer disconnected")]
-    Disconnected,
+    #[error("peer disconnected (data={0:?})")]
+    Disconnected(Option<u32>),
 
     #[error("connection refused")]
     ConnectionRefused,

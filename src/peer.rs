@@ -97,18 +97,26 @@ impl Sink<Packet> for PeerSender {
 
 // ── PeerReceiver ──────────────────────────────────────────────────────────────
 
+/// Internal channel item: `Ok(pkt)` = data, `Err(data)` = disconnect with optional app data.
+type PeerMsg = std::result::Result<Packet, Option<u32>>;
+
 /// The receiving half of a [`Peer`] connection.
 ///
-/// Implements [`Stream<Item = Packet>`].
+/// Implements [`Stream<Item = Result<Packet>>`].
 pub struct PeerReceiver {
-    pub rx: mpsc::Receiver<Packet>,
+    pub rx: mpsc::Receiver<PeerMsg>,
 }
 
 impl Stream for PeerReceiver {
-    type Item = Packet;
+    type Item = Result<Packet>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Packet>> {
-        self.rx.poll_recv(cx)
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Packet>>> {
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(Some(Ok(pkt)))    => Poll::Ready(Some(Ok(pkt))),
+            Poll::Ready(Some(Err(data)))  => Poll::Ready(Some(Err(Error::Disconnected(data)))),
+            Poll::Ready(None)             => Poll::Ready(None),
+            Poll::Pending                 => Poll::Pending,
+        }
     }
 }
 
@@ -116,8 +124,8 @@ impl Stream for PeerReceiver {
 
 /// A connected ENet peer.
 ///
-/// Implements both [`Sink<Packet>`] and [`Stream<Item = Packet>`] and can be
-/// split into a [`PeerSender`] and [`PeerReceiver`] with [`Peer::split`].
+/// Implements [`Sink<Packet>`] for sending and [`Stream<Item = Result<Packet>>`] for
+/// receiving. Can be split into a [`PeerSender`] and [`PeerReceiver`] with [`Peer::split`].
 ///
 /// # Example
 ///
@@ -128,8 +136,8 @@ impl Stream for PeerReceiver {
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let mut peer = Host::connect("127.0.0.1:7777", 2).await?;
 /// peer.send(Packet::reliable(b"hello".as_slice(), 0)).await?;
-/// if let Some(reply) = peer.next().await {
-///     println!("got {} bytes on channel {}", reply.data.len(), reply.channel);
+/// while let Ok(pkt) = peer.recv().await {
+///     println!("got {} bytes on ch{}", pkt.data.len(), pkt.channel);
 /// }
 /// # Ok(())
 /// # }
@@ -140,7 +148,7 @@ pub struct Peer {
 }
 
 impl Peer {
-    pub(crate) fn new(key: PeerKey, task_tx: mpsc::Sender<ToTask>, rx: mpsc::Receiver<Packet>) -> Self {
+    pub(crate) fn new(key: PeerKey, task_tx: mpsc::Sender<ToTask>, rx: mpsc::Receiver<PeerMsg>) -> Self {
         Self {
             sender: PeerSender::new(key, task_tx),
             receiver: PeerReceiver { rx },
@@ -162,9 +170,18 @@ impl Peer {
         self.sender.send_packet(pkt).await
     }
 
-    /// Receive the next packet. Returns `None` when disconnected.
-    pub async fn recv(&mut self) -> Option<Packet> {
-        self.receiver.rx.recv().await
+    /// Receive the next packet.
+    ///
+    /// Returns `Err(Error::Disconnected(Some(data)))` when the remote peer sends a
+    /// graceful disconnect (with the application-defined reason in `data`).
+    /// Returns `Err(Error::Disconnected(None))` on connection timeout.
+    /// Returns `Err(Error::ChannelClosed)` when the host task has shut down.
+    pub async fn recv(&mut self) -> Result<Packet> {
+        match self.receiver.rx.recv().await {
+            Some(Ok(pkt))   => Ok(pkt),
+            Some(Err(data)) => Err(Error::Disconnected(data)),
+            None            => Err(Error::ChannelClosed),
+        }
     }
 
     /// Initiate a graceful disconnect.
@@ -196,9 +213,9 @@ impl Sink<Packet> for Peer {
 
 // Stream: delegate to receiver
 impl Stream for Peer {
-    type Item = Packet;
+    type Item = Result<Packet>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Packet>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Packet>>> {
         Pin::new(&mut self.receiver).poll_next(cx)
     }
 }
