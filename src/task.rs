@@ -179,7 +179,7 @@ impl PeerEntry {
     }
 
     fn initial_rtt_timeout(&self) -> u32 {
-        (self.rtt + 4 * self.rtt_var).max(200)
+        self.rtt.saturating_add(self.rtt_var.saturating_mul(4)).max(200)
     }
 
     /// Bump the outgoing connection-level reliable sequence number.
@@ -835,9 +835,8 @@ impl HostTask {
             .min(peer_window)
             .min(connect.window_size)
             .clamp(WINDOW_SIZE_MIN, WINDOW_SIZE_MAX);
-        let ch = (connect.channel_count as u8)
-            .max(1)
-            .min(protocol::MAX_CHANNELS as u8);
+        let ch = connect.channel_count
+            .clamp(1, protocol::MAX_CHANNELS as u32) as u8;
 
         let mut entry = PeerEntry {
             addr: from,
@@ -1422,13 +1421,14 @@ impl HostTask {
                 // Use original_sent_time for the hard timeout deadlines so that
                 // resetting sent_time on retransmit doesn't prevent 30 s max timeout.
                 let elapsed = now_ms.wrapping_sub(r.original_sent_time);
-                let attempts_over = (1u32 << r.send_attempts.saturating_sub(1)) >= TIMEOUT_LIMIT;
+                let shift = r.send_attempts.saturating_sub(1).min(31);
+                let attempts_over = (1u32 << shift) >= TIMEOUT_LIMIT;
                 if elapsed >= TIMEOUT_MAXIMUM_MS || (attempts_over && elapsed >= TIMEOUT_MINIMUM_MS) {
                     timed_out = true;
                     break;
                 }
                 r.send_attempts += 1;
-                r.rtt_timeout *= 2;
+                r.rtt_timeout = r.rtt_timeout.saturating_mul(2);
                 r.sent_time = now_ms;
                 retransmits.push(r.packet_bytes.clone());
             }
