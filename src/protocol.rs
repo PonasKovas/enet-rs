@@ -611,8 +611,8 @@ pub fn parse_commands(mut buf: &[u8]) -> Vec<Command> {
 
 // ── Sequence number helpers ───────────────────────────────────────────────────
 
-/// Returns true if `b` comes after `a` in wrapped 16-bit sequence space.
+/// Returns true if `a` comes before `b` in wrapped 16-bit sequence space.
 #[inline]
-pub fn seq_gt(a: u16, b: u16) -> bool {
+pub fn seq_lt(a: u16, b: u16) -> bool {
     (b.wrapping_sub(a) as i16) > 0
 }

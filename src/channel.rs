@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use bytes::{Bytes, BytesMut};
 
-use crate::protocol::{FREE_RELIABLE_WINDOWS, RELIABLE_WINDOW_SIZE, seq_gt};
+use crate::protocol::{FREE_RELIABLE_WINDOWS, RELIABLE_WINDOW_SIZE, seq_lt};
 
 // ── Fragment reassembly ───────────────────────────────────────────────────────
 
@@ -126,7 +126,7 @@ impl Channel {
                 }
             }
             out
-        } else if seq_gt(expected, seq) {
+        } else if seq_lt(expected, seq) {
             // Buffer only if within the receive window (FREE_RELIABLE_WINDOWS * RELIABLE_WINDOW_SIZE = 32 768)
             let window: u16 = FREE_RELIABLE_WINDOWS * RELIABLE_WINDOW_SIZE;
             if seq.wrapping_sub(expected) <= window {
@@ -142,7 +142,7 @@ impl Channel {
     /// Receive an unreliable sequenced message. Returns Some(data) if accepted.
     pub fn receive_unreliable(&mut self, seq: u16, data: Bytes) -> Option<Bytes> {
         // Accept if seq comes strictly after current incoming seq
-        if seq_gt(self.incoming_unreliable_seq, seq) {
+        if seq_lt(self.incoming_unreliable_seq, seq) {
             self.incoming_unreliable_seq = seq;
             Some(data)
         } else {
@@ -167,36 +167,41 @@ impl UnsequencedWindow {
     }
 
     /// Returns true if the packet with this group is new (not a duplicate).
+    ///
+    /// `self.group` tracks the highest received group (high-water mark).
+    /// The window covers the 1024 most recent group values.
     pub fn check_and_set(&mut self, group: u16) -> bool {
-        // Compute index relative to current window base
         let diff = group.wrapping_sub(self.group) as i16;
-        if diff >= 0 {
-            // Advance window if needed
+
+        if diff > 0 {
+            // This group is ahead of the current high-water mark — advance.
             let advance = diff as u16;
-            if advance >= 64 {
-                // Fully outside old window — reset
+            if advance >= 1024 {
+                // More than the full window ahead: reset everything.
                 self.window = [0u32; 32];
-            } else if advance > 0 {
-                // Clear bits for the newly valid positions
-                for i in 0..advance {
-                    let idx = (self.group.wrapping_add(i + 1)) as usize % 1024;
-                    self.window[idx / 32] &= !(1 << (idx % 32));
+            } else {
+                // Slide forward: clear the bits for positions being recycled.
+                for i in 1..=advance {
+                    let pos = self.group.wrapping_add(i);
+                    let idx = pos as usize % 1024;
+                    self.window[idx / 32] &= !(1u32 << (idx % 32));
                 }
             }
-            if diff as u16 >= 64 {
-                self.group = group.wrapping_sub(63);
-            } else {
-                // self.group stays
+            self.group = group;
+        } else if diff < 0 {
+            // This group is behind the high-water mark.
+            let behind = (-(diff as i32)) as u16;
+            if behind >= 1024 {
+                return false; // Too old — outside the dedup window.
             }
-        } else if diff < -64 {
-            return false; // too old
         }
+        // diff == 0: same as current high-water mark; bit should already be set.
 
         let idx = group as usize % 1024;
         let word = idx / 32;
         let bit = 1u32 << (idx % 32);
         if self.window[word] & bit != 0 {
-            return false; // duplicate
+            return false; // Duplicate.
         }
         self.window[word] |= bit;
         true

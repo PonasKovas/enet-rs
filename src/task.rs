@@ -68,6 +68,9 @@ pub enum PeerState {
 struct OutstandingReliable {
     reliable_seq: u16,
     channel_id: u8,
+    /// Time of the original (first) transmission — used for absolute timeout checks.
+    original_sent_time: u32,
+    /// Time of the most recent transmission — reset on each retransmit, used for RTT.
     sent_time: u32,
     rtt_timeout: u32,
     send_attempts: u32,
@@ -275,6 +278,7 @@ impl HostTask {
         peer.outgoing_reliable.push(OutstandingReliable {
             reliable_seq: seq,
             channel_id,
+            original_sent_time: now_ms,
             sent_time: now_ms,
             rtt_timeout: timeout,
             send_attempts: 1,
@@ -979,6 +983,7 @@ impl HostTask {
                         p.outgoing_reliable.push(OutstandingReliable {
                             reliable_seq: seq,
                             channel_id: ch,
+                            original_sent_time: now_ms,
                             sent_time: now_ms,
                             rtt_timeout: timeout,
                             send_attempts: 1,
@@ -998,12 +1003,16 @@ impl HostTask {
                 if pkt.data.len() <= max_payload {
                     let data = pkt.data;
                     let data_len = data.len() as u16;
-                    let seq = {
+                    let (unreliable_seq, reliable_seq) = {
                         let p = self.peer_mut(key).unwrap();
-                        p.channels[ch as usize].next_unreliable_seq()
+                        let u = p.channels[ch as usize].next_unreliable_seq();
+                        let r = p.channels[ch as usize].outgoing_reliable_seq;
+                        (u, r)
                     };
-                    let cmd = encode_command(CMD_SEND_UNRELIABLE, 0, ch, seq, move |buf| {
-                        buf.extend_from_slice(&seq.to_be_bytes());
+                    // Per spec: command header carries the channel's current reliable seq;
+                    // the unreliable sequence number goes in the payload.
+                    let cmd = encode_command(CMD_SEND_UNRELIABLE, 0, ch, reliable_seq, move |buf| {
+                        buf.extend_from_slice(&unreliable_seq.to_be_bytes());
                         buf.extend_from_slice(&data_len.to_be_bytes());
                         buf.extend_from_slice(&data);
                     });
@@ -1014,9 +1023,12 @@ impl HostTask {
                     let total = pkt.data.len();
                     let frag_count = (total + frag_payload - 1) / frag_payload;
                     let data = pkt.data;
-                    let start_seq = {
+                    // start_seq is the unreliable sequence of the first fragment (grouping key).
+                    let (start_seq, reliable_seq) = {
                         let p = self.peer_mut(key).unwrap();
-                        p.channels[ch as usize].next_unreliable_seq()
+                        let u = p.channels[ch as usize].next_unreliable_seq();
+                        let r = p.channels[ch as usize].outgoing_reliable_seq;
+                        (u, r)
                     };
 
                     let mut cmds = Vec::with_capacity(frag_count);
@@ -1031,13 +1043,11 @@ impl HostTask {
                         let tot = total as u32;
                         let fo = offset as u32;
                         let frag2 = frag.clone();
-                        let seq = if i == 0 {
-                            start_seq
-                        } else {
-                            let p = self.peer_mut(key).unwrap();
-                            p.channels[ch as usize].next_unreliable_seq()
-                        };
-                        let cmd = encode_command(CMD_SEND_UNRELIABLE_FRAGMENT, 0, ch, seq, move |buf| {
+                        // Header carries the channel reliable seq; payload start_seq is the
+                        // first fragment's unreliable seq used as the assembly group key.
+                        // All fragments in the group share the same start_seq (only the first
+                        // fragment advances the unreliable counter — already done above).
+                        let cmd = encode_command(CMD_SEND_UNRELIABLE_FRAGMENT, 0, ch, reliable_seq, move |buf| {
                             buf.extend_from_slice(&s_seq.to_be_bytes());
                             buf.extend_from_slice(&frag_len.to_be_bytes());
                             buf.extend_from_slice(&fc.to_be_bytes());
@@ -1145,10 +1155,13 @@ impl HostTask {
             let mut retransmits = Vec::new();
 
             for r in &mut p.outgoing_reliable {
-                let elapsed = now_ms.wrapping_sub(r.sent_time);
-                if elapsed < r.rtt_timeout {
+                let elapsed_since_last = now_ms.wrapping_sub(r.sent_time);
+                if elapsed_since_last < r.rtt_timeout {
                     continue;
                 }
+                // Use original_sent_time for the hard timeout deadlines so that
+                // resetting sent_time on retransmit doesn't prevent 30 s max timeout.
+                let elapsed = now_ms.wrapping_sub(r.original_sent_time);
                 let attempts_over = (1u32 << r.send_attempts.saturating_sub(1)) >= TIMEOUT_LIMIT;
                 if elapsed >= TIMEOUT_MAXIMUM_MS || (attempts_over && elapsed >= TIMEOUT_MINIMUM_MS) {
                     timed_out = true;

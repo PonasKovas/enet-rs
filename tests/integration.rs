@@ -3,17 +3,6 @@ use std::time::Duration;
 use enet_rs::{Host, HostConfig, Packet, SendMode};
 use tokio::time::timeout;
 
-/// Bind a server on an OS-assigned port, return the address.
-async fn bind_server(cfg: HostConfig) -> (Host, std::net::SocketAddr) {
-    let host = Host::bind("127.0.0.1:0", cfg).await.unwrap();
-    // We need to know the port — bind with port 0 then read it back.
-    // Since we can't query the port from Host directly, bind on a fixed ephemeral port.
-    // Workaround: bind on port 0 is fine but we need the address. Let's use a helper socket
-    // to find a free port first.
-    // Actually: just bind on a known free port by using port=0 and query via a temp socket.
-    (host, "127.0.0.1:0".parse().unwrap())
-}
-
 /// Pick a free local TCP/UDP port.
 fn free_port() -> u16 {
     let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
