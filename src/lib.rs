@@ -158,6 +158,8 @@ impl Host {
             task_rx,
             config.max_peers,
             config.use_checksum,
+            config.incoming_bandwidth,
+            config.outgoing_bandwidth,
         );
         tokio::spawn(task.run());
 
@@ -208,6 +210,8 @@ impl Host {
             task_rx,
             1, // only one peer
             false,
+            0, // no incoming bandwidth limit for client
+            0, // no outgoing bandwidth limit for client
         );
         tokio::spawn(task.run());
 
@@ -222,10 +226,12 @@ impl Host {
             .await
             .map_err(|_| Error::ChannelClosed)?;
 
-        let (key, rx) = timeout(connect_timeout, reply_rx)
-            .await
-            .map_err(|_| Error::TimedOut)?
-            .map_err(|_| Error::ChannelClosed)??;
+        // Unwrap the three layers: timeout, oneshot cancellation, inner Result.
+        let (key, rx) = match timeout(connect_timeout, reply_rx).await {
+            Err(_elapsed) => return Err(Error::TimedOut),
+            Ok(Err(_canceled)) => return Err(Error::ChannelClosed),
+            Ok(Ok(result)) => result?,
+        };
 
         Ok(Peer::new(key, task_tx, rx))
     }

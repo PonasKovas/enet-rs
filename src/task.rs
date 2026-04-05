@@ -21,10 +21,10 @@ use crate::{
         CMD_PING, CMD_SEND_FRAGMENT, CMD_SEND_RELIABLE, CMD_SEND_UNRELIABLE,
         CMD_SEND_UNRELIABLE_FRAGMENT, CMD_SEND_UNSEQUENCED, CMD_THROTTLE_CONFIGURE,
         CMD_VERIFY_CONNECT, COMMAND_FLAG_ACKNOWLEDGE, COMMAND_FLAG_UNSEQUENCED,
-        DEFAULT_PACKET_THROTTLE, DEFAULT_PING_INTERVAL_MS, DEFAULT_RTT_MS,
-        FREE_RELIABLE_WINDOWS, HEADER_FLAG_SENT_TIME, HEADER_PEER_ID_MAX, HEADER_SESSION_SHIFT,
-        MAX_FRAGMENT_COUNT, MTU_DEFAULT, MTU_MAX, MTU_MIN, PACKET_THROTTLE_SCALE,
-        PEER_ID_UNASSIGNED, RELIABLE_WINDOW_SIZE,
+        BANDWIDTH_THROTTLE_INTERVAL_MS, DEFAULT_PACKET_THROTTLE, DEFAULT_PING_INTERVAL_MS,
+        DEFAULT_RTT_MS, FREE_RELIABLE_WINDOWS, HEADER_FLAG_SENT_TIME, HEADER_PEER_ID_MAX,
+        HEADER_SESSION_SHIFT, MAX_FRAGMENT_COUNT, MTU_DEFAULT, MTU_MAX, MTU_MIN,
+        PACKET_THROTTLE_SCALE, PEER_ID_UNASSIGNED, RELIABLE_WINDOW_SIZE,
         THROTTLE_ACCELERATION, THROTTLE_DECELERATION, THROTTLE_INTERVAL_MS,
         TIMEOUT_LIMIT, TIMEOUT_MAXIMUM_MS, TIMEOUT_MINIMUM_MS, WINDOW_SIZE_MAX, WINDOW_SIZE_MIN,
     },
@@ -33,6 +33,11 @@ use crate::{
 /// Maximum concurrent in-progress fragment reassemblies per channel.
 /// Caps per-channel memory use and prevents fragment-buffer exhaustion (DoS).
 const MAX_FRAGMENT_BUFFERS_PER_CHANNEL: usize = 64;
+
+/// Maximum total bytes held in in-progress fragment buffers across all channels
+/// for a single peer. Prevents a malicious peer from exhausting host memory by
+/// opening many small-fragment reassemblies each claiming a large `total_length`.
+const MAX_FRAGMENT_BYTES_PER_PEER: usize = 16 * 1024 * 1024; // 16 MiB
 
 type ConnectReplySender = tokio::sync::oneshot::Sender<Result<(PeerKey, mpsc::Receiver<Packet>), Error>>;
 
@@ -122,6 +127,16 @@ struct PeerEntry {
     /// Drained periodically in service_one once window space frees up.
     pending_send: VecDeque<Packet>,
 
+    /// Total bytes currently committed to in-progress fragment reassembly buffers.
+    /// Checked before allocating new buffers to prevent per-peer memory exhaustion.
+    fragment_bytes_in_flight: usize,
+
+    /// Timestamp of the start of the current throttle measurement interval.
+    packet_throttle_epoch: u32,
+    /// RTT snapshot taken at the start of the current throttle interval.
+    /// Used to determine if the link has improved or degraded.
+    rtt_at_throttle_epoch: u32,
+
     /// Delivers decoded packets to the user-facing Peer.
     to_user: mpsc::Sender<Packet>,
     /// Held until the connection is established, then given to the user.
@@ -180,6 +195,8 @@ pub(crate) struct HostTask {
     outgoing_bandwidth: u32,
     use_checksum: bool,
     epoch: Instant,
+    /// Timestamp of the start of the current bandwidth-throttle measurement window.
+    bandwidth_throttle_epoch: u32,
 }
 
 impl HostTask {
@@ -189,6 +206,8 @@ impl HostTask {
         user_rx: mpsc::Receiver<ToTask>,
         max_peers: usize,
         use_checksum: bool,
+        incoming_bandwidth: u32,
+        outgoing_bandwidth: u32,
     ) -> Self {
         let mut peers = Vec::with_capacity(max_peers);
         peers.resize_with(max_peers, || None);
@@ -199,10 +218,11 @@ impl HostTask {
             accept_tx,
             user_rx,
             host_mtu: MTU_DEFAULT,
-            incoming_bandwidth: 0,
-            outgoing_bandwidth: 0,
+            incoming_bandwidth,
+            outgoing_bandwidth,
             use_checksum,
             epoch: Instant::now(),
+            bandwidth_throttle_epoch: 0,
         }
     }
 
@@ -352,6 +372,9 @@ impl HostTask {
             unsequenced_window: UnsequencedWindow::new(),
             outgoing_reliable: BTreeMap::new(),
             pending_send: VecDeque::new(),
+            fragment_bytes_in_flight: 0,
+            packet_throttle_epoch: 0,
+            rtt_at_throttle_epoch: DEFAULT_RTT_MS,
             to_user: tx,
             to_user_rx: Some(rx),
             connect_reply: Some(reply),
@@ -644,24 +667,42 @@ impl HostTask {
             p.last_receive_time = now_ms;
             if ch as usize >= p.channels.len() { return; }
 
-            let chan = &mut p.channels[ch as usize];
-
-            // DoS guard: cap concurrent in-progress reassemblies per channel.
-            // Without this, a single malicious peer can force 2+ TB of allocation.
-            if !chan.fragment_buffers.contains_key(&sf.start_seq)
-                && chan.fragment_buffers.len() >= MAX_FRAGMENT_BUFFERS_PER_CHANNEL
-            {
-                return;
+            // DoS guards: check limits before touching the fragment buffer map.
+            let is_new = !p.channels[ch as usize].fragment_buffers.contains_key(&sf.start_seq);
+            if is_new {
+                // Per-channel buffer count limit.
+                if p.channels[ch as usize].fragment_buffers.len() >= MAX_FRAGMENT_BUFFERS_PER_CHANNEL {
+                    return;
+                }
+                // Per-peer total memory budget. Prevents opening many reassemblies each
+                // claiming a large total_length (e.g. 65 536 × 32 MiB = 2 TiB).
+                let new_total = p.fragment_bytes_in_flight.saturating_add(sf.total_length as usize);
+                if new_total > MAX_FRAGMENT_BYTES_PER_PEER {
+                    return;
+                }
+                p.fragment_bytes_in_flight = new_total;
             }
 
-            let buf = chan.fragment_buffers
-                .entry(sf.start_seq)
-                .or_insert_with(|| FragmentBuffer::new(sf.total_length as usize, sf.fragment_count));
+            // Receive the fragment; the mutable borrow of channels is scoped here.
+            let done = {
+                let chan = &mut p.channels[ch as usize];
+                let buf = chan.fragment_buffers
+                    .entry(sf.start_seq)
+                    .or_insert_with(|| FragmentBuffer::new(sf.total_length as usize, sf.fragment_count));
+                buf.receive(sf.fragment_number, sf.fragment_offset as usize, &sf.data)
+            };
 
-            let done = buf.receive(sf.fragment_number, sf.fragment_offset as usize, &sf.data);
             if done {
+                // Release the per-peer memory budget.
+                p.fragment_bytes_in_flight =
+                    p.fragment_bytes_in_flight.saturating_sub(sf.total_length as usize);
+
                 let frag_count = sf.fragment_count;
-                let assembled = chan.fragment_buffers.remove(&sf.start_seq).unwrap().finish();
+                let assembled = p.channels[ch as usize]
+                    .fragment_buffers.remove(&sf.start_seq).unwrap().finish();
+
+                // Re-borrow channel now that fragment_buffers entry is removed.
+                let chan = &mut p.channels[ch as usize];
 
                 if reliable {
                     // receive_reliable advances incoming_reliable_seq to start_seq, but the
@@ -722,7 +763,12 @@ impl HostTask {
         }
         let slot = match self.alloc_slot() {
             Some(s) => s,
-            None => { warn!("no peer slots"); return; }
+            None => {
+                warn!("no peer slots available; rejecting CONNECT from {}", from);
+                // Inform the connecting client immediately so it does not time-out waiting.
+                self.send_raw_disconnect(&connect, from, now_ms).await;
+                return;
+            }
         };
         let key = PeerKey(slot);
         let (tx, rx) = mpsc::channel(256);
@@ -787,6 +833,9 @@ impl HostTask {
             unsequenced_window: UnsequencedWindow::new(),
             outgoing_reliable: BTreeMap::new(),
             pending_send: VecDeque::new(),
+            fragment_bytes_in_flight: 0,
+            packet_throttle_epoch: 0,
+            rtt_at_throttle_epoch: DEFAULT_RTT_MS,
             to_user: tx,
             to_user_rx: Some(rx),
             connect_reply: None,
@@ -915,6 +964,31 @@ impl HostTask {
             if now_ms >= t32 {
                 let sample = (now_ms - t32).max(1);
                 peer.update_rtt(sample);
+            }
+
+            // ── Adaptive throttle (ENet spec §"Packet Throttle") ──────────────
+            // Once per throttle_interval, compare current RTT to the snapshot taken
+            // at the start of the interval. If the link improved, increase the
+            // packet throttle; if it degraded significantly, decrease it.
+            if peer.packet_throttle_epoch == 0
+                || now_ms.wrapping_sub(peer.packet_throttle_epoch) >= peer.throttle_interval
+            {
+                let prev_rtt = peer.rtt_at_throttle_epoch;
+                peer.packet_throttle_epoch = now_ms;
+                peer.rtt_at_throttle_epoch = peer.rtt;
+
+                if prev_rtt > 0 && peer.rtt_initialized {
+                    if peer.rtt < prev_rtt {
+                        // Link improved — accelerate.
+                        peer.packet_throttle = (peer.packet_throttle + peer.throttle_acceleration)
+                            .min(PACKET_THROTTLE_SCALE);
+                    } else if peer.rtt > prev_rtt.saturating_add(2 * peer.rtt_var) {
+                        // Link significantly worsened — decelerate.
+                        peer.packet_throttle = peer.packet_throttle
+                            .saturating_sub(peer.throttle_deceleration);
+                    }
+                    // Else RTT is stable — leave throttle unchanged.
+                }
             }
 
             let seq = ack.received_reliable_seq;
@@ -1185,10 +1259,30 @@ impl HostTask {
 
     // ── Disconnect ────────────────────────────────────────────────────────────
 
+    /// Send a bare CMD_DISCONNECT datagram to `addr` without needing a peer slot.
+    /// Used to reject incoming CONNECT requests when no slot is available.
+    async fn send_raw_disconnect(&self, connect: &ConnectCmd, addr: SocketAddr, now_ms: u32) {
+        let mut buf = BytesMut::new();
+        // Datagram header: use the client's outgoing_peer_id so it recognises the packet.
+        let peer_id_raw = HEADER_FLAG_SENT_TIME
+            | (connect.outgoing_peer_id & 0x0FFF);
+        buf.extend_from_slice(&peer_id_raw.to_be_bytes());
+        buf.extend_from_slice(&(now_ms as u16).to_be_bytes());
+        // CMD_DISCONNECT, seq 0, no data.
+        buf.extend_from_slice(&encode_command(CMD_DISCONNECT, 0, CHANNEL_ID_CONNECTION, 0, |b| {
+            b.extend_from_slice(&0u32.to_be_bytes());
+        }));
+        let _ = self.socket.send_to(&buf, addr).await;
+    }
+
     async fn send_disconnect(&mut self, key: PeerKey, data: u32, now_ms: u32) {
         // If reliable packets are still queued, defer until the queue drains.
         {
             let p = match self.peer_mut(key) { Some(p) => p, None => return };
+            // Idempotent: ignore if already in the disconnect process.
+            if matches!(p.state, PeerState::Disconnecting | PeerState::DisconnectLater(_)) {
+                return;
+            }
             if !p.outgoing_reliable.is_empty() {
                 p.state = PeerState::DisconnectLater(data);
                 return;
@@ -1226,6 +1320,74 @@ impl HostTask {
 
         for key in keys {
             self.service_one(key, now_ms).await;
+        }
+
+        self.bandwidth_throttle(now_ms).await;
+    }
+
+    /// Enforce host-wide outgoing/incoming bandwidth limits.
+    ///
+    /// Runs every [`BANDWIDTH_THROTTLE_INTERVAL_MS`] and:
+    /// 1. Proportionally shrinks each peer's effective send window so the sum
+    ///    of all peer windows does not exceed the host's `outgoing_bandwidth`.
+    /// 2. Sends CMD_BANDWIDTH_LIMIT to every connected peer advertising our
+    ///    `incoming_bandwidth` so they throttle how much they send to us.
+    async fn bandwidth_throttle(&mut self, now_ms: u32) {
+        if now_ms.wrapping_sub(self.bandwidth_throttle_epoch) < BANDWIDTH_THROTTLE_INTERVAL_MS as u32 {
+            return;
+        }
+        self.bandwidth_throttle_epoch = now_ms;
+
+        if self.incoming_bandwidth == 0 && self.outgoing_bandwidth == 0 {
+            return;
+        }
+
+        let connected_keys: Vec<PeerKey> = self.peers.iter().enumerate()
+            .filter_map(|(i, p)| {
+                p.as_ref().and_then(|e| {
+                    if e.state == PeerState::Connected { Some(PeerKey(i)) } else { None }
+                })
+            })
+            .collect();
+
+        let peer_count = connected_keys.len() as u32;
+        if peer_count == 0 {
+            return;
+        }
+
+        // Adjust per-peer window sizes to distribute our outgoing bandwidth budget.
+        if self.outgoing_bandwidth > 0 {
+            let per_peer = (self.outgoing_bandwidth / peer_count).clamp(WINDOW_SIZE_MIN, WINDOW_SIZE_MAX);
+            for &key in &connected_keys {
+                if let Some(p) = self.peer_mut(key) {
+                    p.window_size = per_peer;
+                }
+            }
+        }
+
+        // Notify each peer of our bandwidth limits via CMD_BANDWIDTH_LIMIT.
+        // incoming_bandwidth tells the peer how fast it may send to us.
+        // outgoing_bandwidth / N is what we can send to each peer.
+        let ib = self.incoming_bandwidth;
+        let ob = if self.outgoing_bandwidth > 0 {
+            self.outgoing_bandwidth / peer_count
+        } else {
+            0
+        };
+
+        if ib == 0 && ob == 0 {
+            return;
+        }
+
+        for key in connected_keys {
+            let cmd = {
+                let p = match self.peer_mut(key) { Some(p) => p, None => continue };
+                Self::make_reliable(p, CHANNEL_ID_CONNECTION, CMD_BANDWIDTH_LIMIT, 0, now_ms, move |buf| {
+                    buf.extend_from_slice(&ib.to_be_bytes());
+                    buf.extend_from_slice(&ob.to_be_bytes());
+                })
+            };
+            self.emit_by_key(key, &[cmd], now_ms).await;
         }
     }
 

@@ -32,6 +32,17 @@ impl PeerSender {
     }
 }
 
+impl Drop for PeerSender {
+    fn drop(&mut self) {
+        // Best-effort graceful disconnect when the sending half is dropped without
+        // an explicit call to `disconnect()`. Silently ignored if the task is gone.
+        let _ = self.task_tx.try_send(ToTask::Disconnect {
+            peer_key: self.key,
+            data: 0,
+        });
+    }
+}
+
 impl PeerSender {
     /// Send a packet, waiting until the internal send buffer has room.
     pub async fn send_packet(&self, pkt: Packet) -> Result<()> {
