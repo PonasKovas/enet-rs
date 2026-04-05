@@ -1,6 +1,6 @@
 /// Background I/O task: owns the UDP socket and all peer state machines.
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, VecDeque},
     net::SocketAddr,
     time::{Duration, Instant},
 };
@@ -21,12 +21,18 @@ use crate::{
         CMD_PING, CMD_SEND_FRAGMENT, CMD_SEND_RELIABLE, CMD_SEND_UNRELIABLE,
         CMD_SEND_UNRELIABLE_FRAGMENT, CMD_SEND_UNSEQUENCED, CMD_THROTTLE_CONFIGURE,
         CMD_VERIFY_CONNECT, COMMAND_FLAG_ACKNOWLEDGE, COMMAND_FLAG_UNSEQUENCED,
-        DEFAULT_PING_INTERVAL_MS, DEFAULT_RTT_MS, HEADER_FLAG_SENT_TIME, HEADER_SESSION_SHIFT,
-        MAX_FRAGMENT_COUNT, MTU_DEFAULT, MTU_MAX, MTU_MIN, PEER_ID_UNASSIGNED,
-        THROTTLE_ACCELERATION, THROTTLE_DECELERATION, THROTTLE_INTERVAL_MS, TIMEOUT_LIMIT,
-        TIMEOUT_MAXIMUM_MS, TIMEOUT_MINIMUM_MS, WINDOW_SIZE_MAX, WINDOW_SIZE_MIN,
+        DEFAULT_PACKET_THROTTLE, DEFAULT_PING_INTERVAL_MS, DEFAULT_RTT_MS,
+        FREE_RELIABLE_WINDOWS, HEADER_FLAG_SENT_TIME, HEADER_PEER_ID_MAX, HEADER_SESSION_SHIFT,
+        MAX_FRAGMENT_COUNT, MTU_DEFAULT, MTU_MAX, MTU_MIN, PACKET_THROTTLE_SCALE,
+        PEER_ID_UNASSIGNED, RELIABLE_WINDOW_SIZE,
+        THROTTLE_ACCELERATION, THROTTLE_DECELERATION, THROTTLE_INTERVAL_MS,
+        TIMEOUT_LIMIT, TIMEOUT_MAXIMUM_MS, TIMEOUT_MINIMUM_MS, WINDOW_SIZE_MAX, WINDOW_SIZE_MIN,
     },
 };
+
+/// Maximum concurrent in-progress fragment reassemblies per channel.
+/// Caps per-channel memory use and prevents fragment-buffer exhaustion (DoS).
+const MAX_FRAGMENT_BUFFERS_PER_CHANNEL: usize = 64;
 
 type ConnectReplySender = tokio::sync::oneshot::Sender<Result<(PeerKey, mpsc::Receiver<Packet>), Error>>;
 
@@ -90,6 +96,9 @@ struct PeerEntry {
 
     mtu: u32,
     window_size: u32,
+    /// ENet packet throttle (0..=PACKET_THROTTLE_SCALE). Controls how much of window_size
+    /// is usable: effective_window = (packet_throttle / scale) * window_size.
+    packet_throttle: u32,
 
     throttle_interval: u32,
     throttle_acceleration: u32,
@@ -104,7 +113,14 @@ struct PeerEntry {
 
     channels: Vec<Channel>,
     unsequenced_window: UnsequencedWindow,
-    outgoing_reliable: Vec<OutstandingReliable>,
+
+    /// In-flight reliable packets keyed by (channel_id, reliable_seq).
+    /// BTreeMap gives O(log N) ACK removal vs O(N) for Vec::retain.
+    outgoing_reliable: BTreeMap<(u8, u16), OutstandingReliable>,
+
+    /// Packets queued because the reliable send window was full at send time.
+    /// Drained periodically in service_one once window space frees up.
+    pending_send: VecDeque<Packet>,
 
     /// Delivers decoded packets to the user-facing Peer.
     to_user: mpsc::Sender<Packet>,
@@ -275,7 +291,7 @@ impl HostTask {
         );
 
         let timeout = peer.initial_rtt_timeout();
-        peer.outgoing_reliable.push(OutstandingReliable {
+        peer.outgoing_reliable.insert((channel_id, seq), OutstandingReliable {
             reliable_seq: seq,
             channel_id,
             original_sent_time: now_ms,
@@ -323,6 +339,7 @@ impl HostTask {
             outgoing_session_id: 0xFF,
             mtu: self.host_mtu,
             window_size: WINDOW_SIZE_MAX,
+            packet_throttle: DEFAULT_PACKET_THROTTLE,
             throttle_interval: THROTTLE_INTERVAL_MS,
             throttle_acceleration: THROTTLE_ACCELERATION,
             throttle_deceleration: THROTTLE_DECELERATION,
@@ -333,7 +350,8 @@ impl HostTask {
             last_receive_time: now_ms,
             channels: (0..ch).map(|_| Channel::new()).collect(),
             unsequenced_window: UnsequencedWindow::new(),
-            outgoing_reliable: Vec::new(),
+            outgoing_reliable: BTreeMap::new(),
+            pending_send: VecDeque::new(),
             to_user: tx,
             to_user_rx: Some(rx),
             connect_reply: Some(reply),
@@ -389,9 +407,10 @@ impl HostTask {
             return;
         }
 
-        // Resolve peer key early so we can use connectID for checksum validation.
+        // Resolve peer key. HEADER_PEER_ID_MAX (0x0FFF) is the wire encoding of
+        // PEER_ID_UNASSIGNED (0xFFFF masked to 12 bits) — fall back to address lookup.
         let peer_id = hdr.peer_id();
-        let key = if peer_id == PEER_ID_UNASSIGNED {
+        let key = if peer_id == HEADER_PEER_ID_MAX {
             self.addr_map.get(&from).copied()
         } else if (peer_id as usize) < self.peers.len() {
             Some(PeerKey(peer_id as usize))
@@ -430,9 +449,23 @@ impl HostTask {
 
         let sent_time = hdr.sent_time;
         let cmds = protocol::parse_commands(slice);
+
+        // Collect ACKs during command processing; batch-send at the end.
+        // All commands in one datagram originate from the same peer, so one batch suffices.
+        let mut pending_acks: Vec<Bytes> = Vec::new();
+
         for cmd in cmds {
-            self.on_command(key, &hdr, sent_time, cmd, from, now_ms)
+            self.on_command(key, &hdr, sent_time, cmd, from, now_ms, &mut pending_acks)
                 .await;
+        }
+
+        // Send all accumulated ACKs in a single flush (respects MTU).
+        if !pending_acks.is_empty() {
+            // For new connections key may still be None; look up by address after on_connect ran.
+            let ack_key = key.or_else(|| self.addr_map.get(&from).copied());
+            if let Some(k) = ack_key {
+                self.flush_batch(k, pending_acks, now_ms).await;
+            }
         }
     }
 
@@ -444,16 +477,18 @@ impl HostTask {
         cmd: Command,
         from: SocketAddr,
         now_ms: u32,
+        pending_acks: &mut Vec<Bytes>,
     ) {
         match cmd.header.command_type() {
             CMD_CONNECT => {
                 if let CommandBody::Connect(c) = cmd.body {
+                    // on_connect emits its own ACK bundled with VERIFY_CONNECT.
                     self.on_connect(c, cmd.header, sent_time, from, now_ms).await;
                 }
             }
             CMD_VERIFY_CONNECT => {
                 if let (Some(k), CommandBody::VerifyConnect(vc)) = (key, cmd.body) {
-                    self.on_verify_connect(k, vc, cmd.header, sent_time, now_ms)
+                    self.on_verify_connect(k, vc, cmd.header, sent_time, now_ms, pending_acks)
                         .await;
                 }
             }
@@ -465,8 +500,8 @@ impl HostTask {
             CMD_DISCONNECT => {
                 if let Some(k) = key {
                     let graceful = cmd.header.has_ack_flag();
-                    // Per spec: only send ACK when sentTime was present in the datagram header.
                     if graceful {
+                        // Emit ACK immediately before remove_peer destroys the peer state.
                         if let Some(st) = sent_time {
                             let a = Self::ack(cmd.header.channel_id, cmd.header.reliable_seq, st);
                             self.emit_by_key(k, &[a], now_ms).await;
@@ -480,11 +515,9 @@ impl HostTask {
                     if let Some(p) = self.peer_mut(k) {
                         p.last_receive_time = now_ms;
                     }
-                    // Per spec: ACK is only sent when sentTime was present.
                     if cmd.header.has_ack_flag() {
                         if let Some(st) = sent_time {
-                            let a = Self::ack(cmd.header.channel_id, cmd.header.reliable_seq, st);
-                            self.emit_by_key(k, &[a], now_ms).await;
+                            pending_acks.push(Self::ack(cmd.header.channel_id, cmd.header.reliable_seq, st));
                         }
                     }
                 }
@@ -493,10 +526,8 @@ impl HostTask {
                 if let (Some(k), CommandBody::SendReliable(sr)) = (key, cmd.body) {
                     let ch = cmd.header.channel_id;
                     let seq = cmd.header.reliable_seq;
-                    // Per spec: ACK only when sentTime is present.
                     if let Some(st) = sent_time {
-                        let a = Self::ack(ch, seq, st);
-                        self.emit_by_key(k, &[a], now_ms).await;
+                        pending_acks.push(Self::ack(ch, seq, st));
                     }
                     let ready = {
                         let p = match self.peer_mut(k) { Some(p) => p, None => return };
@@ -512,10 +543,16 @@ impl HostTask {
             CMD_SEND_UNRELIABLE => {
                 if let (Some(k), CommandBody::SendUnreliable(su)) = (key, cmd.body) {
                     let ch = cmd.header.channel_id;
+                    // The command header carries the sender's current reliable seq for the channel.
+                    // Drop if this unreliable belongs to an older reliable epoch than we've received.
+                    let reliable_seq_in_cmd = cmd.header.reliable_seq;
                     let accepted = {
                         let p = match self.peer_mut(k) { Some(p) => p, None => return };
                         p.last_receive_time = now_ms;
                         if ch as usize >= p.channels.len() { return; }
+                        if protocol::seq_lt(reliable_seq_in_cmd, p.channels[ch as usize].incoming_reliable_seq) {
+                            return;
+                        }
                         p.channels[ch as usize].receive_unreliable(su.unreliable_seq, su.data)
                     };
                     if let Some(data) = accepted {
@@ -527,10 +564,8 @@ impl HostTask {
                 if let (Some(k), CommandBody::SendFragment(sf)) = (key, cmd.body) {
                     let ch = cmd.header.channel_id;
                     let seq = cmd.header.reliable_seq;
-                    // Per spec: ACK only when sentTime is present.
                     if let Some(st) = sent_time {
-                        let a = Self::ack(ch, seq, st);
-                        self.emit_by_key(k, &[a], now_ms).await;
+                        pending_acks.push(Self::ack(ch, seq, st));
                     }
                     self.on_fragment(k, ch, sf, true, now_ms);
                 }
@@ -609,25 +644,48 @@ impl HostTask {
             p.last_receive_time = now_ms;
             if ch as usize >= p.channels.len() { return; }
 
-            let buf = p.channels[ch as usize]
-                .fragment_buffers
+            let chan = &mut p.channels[ch as usize];
+
+            // DoS guard: cap concurrent in-progress reassemblies per channel.
+            // Without this, a single malicious peer can force 2+ TB of allocation.
+            if !chan.fragment_buffers.contains_key(&sf.start_seq)
+                && chan.fragment_buffers.len() >= MAX_FRAGMENT_BUFFERS_PER_CHANNEL
+            {
+                return;
+            }
+
+            let buf = chan.fragment_buffers
                 .entry(sf.start_seq)
-                .or_insert_with(|| {
-                    FragmentBuffer::new(sf.total_length as usize, sf.fragment_count)
-                });
+                .or_insert_with(|| FragmentBuffer::new(sf.total_length as usize, sf.fragment_count));
 
             let done = buf.receive(sf.fragment_number, sf.fragment_offset as usize, &sf.data);
             if done {
-                let assembled = p.channels[ch as usize]
-                    .fragment_buffers
-                    .remove(&sf.start_seq)
-                    .unwrap()
-                    .finish();
+                let frag_count = sf.fragment_count;
+                let assembled = chan.fragment_buffers.remove(&sf.start_seq).unwrap().finish();
+
                 if reliable {
-                    p.channels[ch as usize].receive_reliable(sf.start_seq, assembled)
+                    // receive_reliable advances incoming_reliable_seq to start_seq, but the
+                    // sender consumed frag_count sequence numbers (start_seq..start_seq+frag_count-1).
+                    // Advance frag_count-1 more so the next expected seq is start_seq+frag_count,
+                    // then drain any packets in the queue that are now reachable.
+                    let mut ready = chan.receive_reliable(sf.start_seq, assembled);
+                    if !ready.is_empty() && frag_count > 1 {
+                        chan.incoming_reliable_seq = chan.incoming_reliable_seq
+                            .wrapping_add((frag_count - 1) as u16);
+                        loop {
+                            let next = chan.incoming_reliable_seq.wrapping_add(1);
+                            if let Some(d) = chan.incoming_reliable_queue.remove(&next) {
+                                chan.incoming_reliable_seq = next;
+                                ready.push(d);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    ready
                 } else {
                     // Apply the same sequence ordering check as non-fragmented unreliable packets.
-                    match p.channels[ch as usize].receive_unreliable(sf.start_seq, assembled) {
+                    match chan.receive_unreliable(sf.start_seq, assembled) {
                         Some(data) => vec![data],
                         None => vec![],
                     }
@@ -716,6 +774,7 @@ impl HostTask {
             outgoing_session_id: out_sess,
             mtu,
             window_size,
+            packet_throttle: DEFAULT_PACKET_THROTTLE,
             throttle_interval: connect.throttle_interval,
             throttle_acceleration: connect.throttle_acceleration,
             throttle_deceleration: connect.throttle_deceleration,
@@ -726,7 +785,8 @@ impl HostTask {
             last_receive_time: now_ms,
             channels: (0..ch).map(|_| Channel::new()).collect(),
             unsequenced_window: UnsequencedWindow::new(),
-            outgoing_reliable: Vec::new(),
+            outgoing_reliable: BTreeMap::new(),
+            pending_send: VecDeque::new(),
             to_user: tx,
             to_user_rx: Some(rx),
             connect_reply: None,
@@ -735,7 +795,6 @@ impl HostTask {
         };
 
         // ACK for CONNECT — only generate if sentTime was present (per spec).
-        // CONNECT always carries sentTime in practice; use 0 as fallback.
         let ack_opt = sent_time.map(|st| Self::ack(CHANNEL_ID_CONNECTION, hdr.reliable_seq, st));
 
         // VERIFY_CONNECT
@@ -777,13 +836,12 @@ impl HostTask {
         );
 
         // Stay in AcknowledgingConnect until the client ACKs VERIFY_CONNECT.
-        // The peer is delivered to accept_tx only after the 3-way handshake completes.
         entry.state = PeerState::AcknowledgingConnect;
-        // to_user_rx remains in the entry; on_ack will take it when the ACK arrives.
 
         self.addr_map.insert(from, key);
         self.peers[slot] = Some(entry);
 
+        // Send ACK and VERIFY_CONNECT bundled in one datagram.
         let mut cmds: Vec<Bytes> = Vec::new();
         if let Some(a) = ack_opt { cmds.push(a); }
         cmds.push(verify);
@@ -799,6 +857,7 @@ impl HostTask {
         hdr: CommandHeader,
         sent_time: Option<u16>,
         now_ms: u32,
+        pending_acks: &mut Vec<Bytes>,
     ) {
         let peer = match self.peer_mut(key) {
             Some(p) => p,
@@ -823,14 +882,13 @@ impl HostTask {
         let rx = peer.to_user_rx.take();
         let reply = peer.connect_reply.take();
 
-        // ACK for VERIFY_CONNECT
+        // ACK for VERIFY_CONNECT (batched with any other ACKs from this datagram).
         let st = sent_time.unwrap_or(0);
-        let ack = Self::ack(CHANNEL_ID_CONNECTION, hdr.reliable_seq, st);
-        self.emit_by_key(key, &[ack], now_ms).await;
+        pending_acks.push(Self::ack(CHANNEL_ID_CONNECTION, hdr.reliable_seq, st));
 
-        // Remove CONNECT from the outstanding queue (VERIFY_CONNECT implicitly acks it)
+        // Remove CONNECT from the outstanding queue (VERIFY_CONNECT implicitly acks it).
         if let Some(p) = self.peer_mut(key) {
-            p.outgoing_reliable.retain(|r| r.channel_id != CHANNEL_ID_CONNECTION || r.reliable_seq != 1);
+            p.outgoing_reliable.remove(&(CHANNEL_ID_CONNECTION, 1));
         }
 
         if let (Some(rx), Some(tx)) = (rx, reply) {
@@ -841,7 +899,7 @@ impl HostTask {
     // ── ACK processing ────────────────────────────────────────────────────────
 
     async fn on_ack(&mut self, key: PeerKey, channel_id: u8, ack: AcknowledgeCmd, now_ms: u32) {
-        let (was_acking_connect, rx_for_user) = {
+        let (was_acking_connect, rx_for_user, should_disconnect) = {
             let peer = match self.peer_mut(key) {
                 Some(p) => p,
                 None => return,
@@ -860,9 +918,8 @@ impl HostTask {
             }
 
             let seq = ack.received_reliable_seq;
-            // Match by both channel and sequence number to avoid cross-channel collisions.
-            peer.outgoing_reliable
-                .retain(|r| !(r.reliable_seq == seq && r.channel_id == channel_id));
+            // O(log N) removal: BTreeMap keyed by (channel_id, reliable_seq).
+            peer.outgoing_reliable.remove(&(channel_id, seq));
 
             // Detect completion of the server-side 3-way handshake.
             // VERIFY_CONNECT is always on CHANNEL_ID_CONNECTION with seq=1.
@@ -870,16 +927,25 @@ impl HostTask {
                 && channel_id == CHANNEL_ID_CONNECTION
                 && seq == 1;
 
+            // Detect graceful disconnect completion: CMD_DISCONNECT was ACKed and queue is empty.
+            let disconnecting_done = peer.state == PeerState::Disconnecting
+                && peer.outgoing_reliable.is_empty();
+
             if completing_handshake {
                 peer.state = PeerState::Connected;
                 let rx = peer.to_user_rx.take();
-                (true, rx)
+                (true, rx, false)
+            } else if disconnecting_done {
+                (false, None, true)
             } else {
-                (false, None)
+                (false, None, false)
             }
         };
 
-        if was_acking_connect {
+        if should_disconnect {
+            // CMD_DISCONNECT was ACKed; clean up the peer entry.
+            self.remove_peer(key);
+        } else if was_acking_connect {
             if let Some(rx) = rx_for_user {
                 let _ = self.accept_tx.try_send((key, rx));
             }
@@ -905,16 +971,35 @@ impl HostTask {
 
         match pkt.mode {
             SendMode::Reliable => {
-                // Enforce the per-channel reliable send window.
+                // Enforce the per-channel reliable send window using sequence-number difference.
+                // Counting in-flight packets is wrong under wrap-around: seq 65537 collides with
+                // seq 1 if the count check passes but the seq-diff check would not.
                 {
-                    let p = match self.peer(key) { Some(p) => p, None => return };
-                    let in_flight = p.outgoing_reliable.iter()
+                    let p = match self.peer_mut(key) { Some(p) => p, None => return };
+                    if ch as usize >= p.channels.len() { return; }
+
+                    let next_seq = p.channels[ch as usize].outgoing_reliable_seq.wrapping_add(1);
+                    let oldest = p.outgoing_reliable.values()
                         .filter(|r| r.channel_id == ch)
-                        .count();
-                    if !p.channels.get(ch as usize)
-                        .map(|c| c.reliable_window_open(in_flight))
-                        .unwrap_or(false)
-                    {
+                        .map(|r| r.reliable_seq)
+                        .reduce(|a, b| if protocol::seq_lt(a, b) { a } else { b });
+
+                    // Effective window accounts for the negotiated packet_throttle.
+                    let effective_window = ((p.packet_throttle as u64 * p.window_size as u64)
+                        / PACKET_THROTTLE_SCALE as u64)
+                        .min(FREE_RELIABLE_WINDOWS as u64 * RELIABLE_WINDOW_SIZE as u64)
+                        as u32;
+
+                    let window_open = match oldest {
+                        None => true,
+                        Some(oldest_seq) => {
+                            let diff = next_seq.wrapping_sub(oldest_seq) as u32;
+                            diff < effective_window
+                        }
+                    };
+                    if !window_open {
+                        // Queue for later instead of silently dropping (reliability guarantee).
+                        p.pending_send.push_back(pkt);
                         return;
                     }
                 }
@@ -979,7 +1064,7 @@ impl HostTask {
                             buf.extend_from_slice(&fo.to_be_bytes());
                             buf.extend_from_slice(&frag2);
                         });
-                        p.outgoing_reliable.push(OutstandingReliable {
+                        p.outgoing_reliable.insert((ch, seq), OutstandingReliable {
                             reliable_seq: seq,
                             channel_id: ch,
                             original_sent_time: now_ms,
@@ -1044,8 +1129,6 @@ impl HostTask {
                         let frag2 = frag.clone();
                         // Header carries the channel reliable seq; payload start_seq is the
                         // first fragment's unreliable seq used as the assembly group key.
-                        // All fragments in the group share the same start_seq (only the first
-                        // fragment advances the unreliable counter — already done above).
                         let cmd = encode_command(CMD_SEND_UNRELIABLE_FRAGMENT, 0, ch, reliable_seq, move |buf| {
                             buf.extend_from_slice(&s_seq.to_be_bytes());
                             buf.extend_from_slice(&frag_len.to_be_bytes());
@@ -1153,7 +1236,7 @@ impl HostTask {
             let mut timed_out = false;
             let mut retransmits = Vec::new();
 
-            for r in &mut p.outgoing_reliable {
+            for r in p.outgoing_reliable.values_mut() {
                 let elapsed_since_last = now_ms.wrapping_sub(r.sent_time);
                 if elapsed_since_last < r.rtt_timeout {
                     continue;
@@ -1191,8 +1274,11 @@ impl HostTask {
             return;
         }
 
+        // Use flush_batch for retransmits to respect MTU and avoid EMSGSIZE errors.
+        // Previously emit_by_key was used here, which could concatenate dozens of
+        // retransmit packets into a single oversized datagram.
         if !retransmits.is_empty() {
-            self.emit_by_key(key, &retransmits, now_ms).await;
+            self.flush_batch(key, retransmits, now_ms).await;
         }
 
         if ping_needed {
@@ -1217,6 +1303,16 @@ impl HostTask {
                 })
             };
             self.emit_by_key(key, &[cmd], now_ms).await;
+        }
+
+        // Drain packets that were queued because the reliable window was full.
+        // Now that some in-flight packets may have been ACKed, try to resend them.
+        let pending: Vec<Packet> = match self.peer_mut(key) {
+            Some(p) => p.pending_send.drain(..).collect(),
+            None => return,
+        };
+        for pkt in pending {
+            self.send_packet(key, pkt, now_ms).await;
         }
     }
 

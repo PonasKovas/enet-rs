@@ -104,6 +104,7 @@ impl Channel {
     }
 
     /// Returns true if the reliable window is open for sending.
+    #[allow(dead_code)]
     pub fn reliable_window_open(&self, in_flight: usize) -> bool {
         in_flight < (FREE_RELIABLE_WINDOWS as usize * RELIABLE_WINDOW_SIZE as usize)
     }

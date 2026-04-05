@@ -5,6 +5,7 @@ use std::{
 
 use futures::{Sink, Stream};
 use tokio::sync::mpsc;
+use tokio_util::sync::PollSender;
 
 use crate::{
     Packet,
@@ -20,6 +21,15 @@ use crate::{
 pub struct PeerSender {
     pub(crate) key: PeerKey,
     pub(crate) task_tx: mpsc::Sender<ToTask>,
+    /// Backpressure-aware sender used by the `Sink` implementation.
+    poll_sender: PollSender<ToTask>,
+}
+
+impl PeerSender {
+    pub(crate) fn new(key: PeerKey, task_tx: mpsc::Sender<ToTask>) -> Self {
+        let poll_sender = PollSender::new(task_tx.clone());
+        Self { key, task_tx, poll_sender }
+    }
 }
 
 impl PeerSender {
@@ -49,18 +59,17 @@ impl PeerSender {
 impl Sink<Packet> for PeerSender {
     type Error = Error;
 
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
-        // The backing channel has a large buffer; report always-ready.
-        // `start_send` will return an error if the channel is genuinely full.
-        Poll::Ready(Ok(()))
+    /// Waits until the backing MPSC channel has capacity (correct backpressure).
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        Pin::new(&mut self.poll_sender)
+            .poll_reserve(cx)
+            .map_err(|_| Error::ChannelClosed)
     }
 
-    fn start_send(self: Pin<&mut Self>, item: Packet) -> Result<()> {
-        self.task_tx
-            .try_send(ToTask::Send {
-                peer_key: self.key,
-                packet: item,
-            })
+    fn start_send(mut self: Pin<&mut Self>, item: Packet) -> Result<()> {
+        let key = self.key;
+        Pin::new(&mut self.poll_sender)
+            .send_item(ToTask::Send { peer_key: key, packet: item })
             .map_err(|_| Error::ChannelClosed)
     }
 
@@ -68,8 +77,10 @@ impl Sink<Packet> for PeerSender {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        Pin::new(&mut self.poll_sender)
+            .poll_close(cx)
+            .map_err(|_| Error::ChannelClosed)
     }
 }
 
@@ -120,10 +131,7 @@ pub struct Peer {
 impl Peer {
     pub(crate) fn new(key: PeerKey, task_tx: mpsc::Sender<ToTask>, rx: mpsc::Receiver<Packet>) -> Self {
         Self {
-            sender: PeerSender {
-                key,
-                task_tx,
-            },
+            sender: PeerSender::new(key, task_tx),
             receiver: PeerReceiver { rx },
         }
     }
