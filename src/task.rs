@@ -39,6 +39,9 @@ const MAX_FRAGMENT_BUFFERS_PER_CHANNEL: usize = 64;
 /// opening many small-fragment reassemblies each claiming a large `total_length`.
 const MAX_FRAGMENT_BYTES_PER_PEER: usize = 16 * 1024 * 1024; // 16 MiB
 
+/// Maximum number of reliable packets queued in `pending_send` when the window is full.
+const MAX_PENDING_SEND: usize = 1024;
+
 type ConnectReplySender = tokio::sync::oneshot::Sender<Result<(PeerKey, mpsc::Receiver<Packet>), Error>>;
 
 // ── Messages: user ↔ task ─────────────────────────────────────────────────────
@@ -147,6 +150,9 @@ struct PeerEntry {
     // Connection-level sequence number tracking
     incoming_reliable_seq: u16,
     outgoing_reliable_seq: u16,
+    /// Sequence number of the handshake command (CONNECT on client, VERIFY_CONNECT on server).
+    /// Stored after `make_reliable` so we never rely on the hardcoded value 1.
+    connect_seq: u16,
 }
 
 impl PeerEntry {
@@ -380,6 +386,7 @@ impl HostTask {
             connect_reply: Some(reply),
             incoming_reliable_seq: 0,
             outgoing_reliable_seq: 0,
+            connect_seq: 0,
         };
 
         let mtu = self.host_mtu;
@@ -410,6 +417,9 @@ impl HostTask {
                 buf.extend_from_slice(&user_data.to_be_bytes());
             },
         );
+
+        // Record the actual seq used for CONNECT so we can remove it precisely later.
+        entry.connect_seq = entry.outgoing_reliable_seq;
 
         self.addr_map.insert(addr, key);
         self.peers[slot] = Some(entry);
@@ -631,9 +641,13 @@ impl HostTask {
             CMD_THROTTLE_CONFIGURE => {
                 if let (Some(k), CommandBody::ThrottleConfigure(tc)) = (key, cmd.body) {
                     if let Some(p) = self.peer_mut(k) {
-                        p.throttle_interval = tc.throttle_interval;
-                        p.throttle_acceleration = tc.throttle_acceleration;
-                        p.throttle_deceleration = tc.throttle_deceleration;
+                        // Ignore zero-interval (would cause division by zero / spin).
+                        // Clamp acceleration/deceleration to the throttle scale range.
+                        if tc.throttle_interval > 0 {
+                            p.throttle_interval = tc.throttle_interval;
+                        }
+                        p.throttle_acceleration = tc.throttle_acceleration.min(PACKET_THROTTLE_SCALE);
+                        p.throttle_deceleration = tc.throttle_deceleration.min(PACKET_THROTTLE_SCALE);
                     }
                 }
             }
@@ -651,6 +665,15 @@ impl HostTask {
     ) {
         // Reject obviously malformed fragments before allocating anything.
         if sf.fragment_count == 0 || sf.fragment_count > MAX_FRAGMENT_COUNT {
+            return;
+        }
+        // Each fragment consumes one reliable sequence number (u16). More than 65536 fragments
+        // would wrap the sequence space, making it impossible to deliver correctly.
+        if sf.fragment_count > u16::MAX as u32 + 1 {
+            return;
+        }
+        // fragment_number must be a valid index within the declared fragment_count.
+        if sf.fragment_number >= sf.fragment_count {
             return;
         }
         if sf.total_length as usize > protocol::MAX_PACKET_SIZE {
@@ -841,6 +864,7 @@ impl HostTask {
             connect_reply: None,
             incoming_reliable_seq: hdr.reliable_seq,
             outgoing_reliable_seq: 0,
+            connect_seq: 0,
         };
 
         // ACK for CONNECT — only generate if sentTime was present (per spec).
@@ -884,6 +908,9 @@ impl HostTask {
             },
         );
 
+        // Record the actual seq used for VERIFY_CONNECT so we can detect its ACK precisely.
+        entry.connect_seq = entry.outgoing_reliable_seq;
+
         // Stay in AcknowledgingConnect until the client ACKs VERIFY_CONNECT.
         entry.state = PeerState::AcknowledgingConnect;
 
@@ -908,6 +935,8 @@ impl HostTask {
         now_ms: u32,
         pending_acks: &mut Vec<Bytes>,
     ) {
+        // Read host_mtu before borrowing the peer (borrow-checker).
+        let host_mtu = self.host_mtu;
         let peer = match self.peer_mut(key) {
             Some(p) => p,
             None => return,
@@ -919,8 +948,9 @@ impl HostTask {
         peer.outgoing_peer_id = vc.outgoing_peer_id;
         peer.incoming_session_id = vc.incoming_session_id;
         peer.outgoing_session_id = vc.outgoing_session_id;
-        peer.mtu = vc.mtu;
-        peer.window_size = vc.window_size;
+        // Clamp to valid ranges so a rogue server can't push us outside our limits.
+        peer.mtu = vc.mtu.clamp(MTU_MIN, MTU_MAX).min(host_mtu);
+        peer.window_size = vc.window_size.clamp(WINDOW_SIZE_MIN, WINDOW_SIZE_MAX);
         peer.throttle_interval = vc.throttle_interval;
         peer.throttle_acceleration = vc.throttle_acceleration;
         peer.throttle_deceleration = vc.throttle_deceleration;
@@ -937,7 +967,8 @@ impl HostTask {
 
         // Remove CONNECT from the outstanding queue (VERIFY_CONNECT implicitly acks it).
         if let Some(p) = self.peer_mut(key) {
-            p.outgoing_reliable.remove(&(CHANNEL_ID_CONNECTION, 1));
+            let connect_seq = p.connect_seq;
+            p.outgoing_reliable.remove(&(CHANNEL_ID_CONNECTION, connect_seq));
         }
 
         if let (Some(rx), Some(tx)) = (rx, reply) {
@@ -996,10 +1027,10 @@ impl HostTask {
             peer.outgoing_reliable.remove(&(channel_id, seq));
 
             // Detect completion of the server-side 3-way handshake.
-            // VERIFY_CONNECT is always on CHANNEL_ID_CONNECTION with seq=1.
+            // VERIFY_CONNECT is on CHANNEL_ID_CONNECTION with the seq recorded in connect_seq.
             let completing_handshake = peer.state == PeerState::AcknowledgingConnect
                 && channel_id == CHANNEL_ID_CONNECTION
-                && seq == 1;
+                && seq == peer.connect_seq;
 
             // Detect graceful disconnect completion: CMD_DISCONNECT was ACKed and queue is empty.
             let disconnecting_done = peer.state == PeerState::Disconnecting
@@ -1021,7 +1052,12 @@ impl HostTask {
             self.remove_peer(key);
         } else if was_acking_connect {
             if let Some(rx) = rx_for_user {
-                let _ = self.accept_tx.try_send((key, rx));
+                if self.accept_tx.try_send((key, rx)).is_err() {
+                    // Application is not consuming peers fast enough; drop this one to
+                    // free the slot rather than leaking it.
+                    warn!("accept channel full; dropping peer {:?}", key);
+                    self.remove_peer(key);
+                }
             }
         }
     }
@@ -1072,8 +1108,10 @@ impl HostTask {
                         }
                     };
                     if !window_open {
-                        // Queue for later instead of silently dropping (reliability guarantee).
-                        p.pending_send.push_back(pkt);
+                        // Queue for later — but cap to prevent unbounded growth.
+                        if p.pending_send.len() < MAX_PENDING_SEND {
+                            p.pending_send.push_back(pkt);
+                        }
                         return;
                     }
                 }
