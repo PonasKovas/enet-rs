@@ -452,12 +452,19 @@ impl HostTask {
         };
 
         // Validate session ID for known peers (0xFF means not yet established).
-        if let Some(k) = key {
-            if let Some(peer) = self.peer(k) {
-                if peer.incoming_session_id != 0xFF
-                    && hdr.session_id() != peer.incoming_session_id
-                {
-                    return;
+        // Skip the check for CMD_CONNECT: it is a new connection attempt and carries
+        // a fresh session ID that won't match the existing peer's recorded session.
+        // We peek at the first command byte (low 4 bits = type) to detect this case.
+        let first_cmd_type = slice.first().map(|b| b & 0x0F);
+        let is_connect_datagram = first_cmd_type == Some(CMD_CONNECT);
+        if !is_connect_datagram {
+            if let Some(k) = key {
+                if let Some(peer) = self.peer(k) {
+                    if peer.incoming_session_id != 0xFF
+                        && hdr.session_id() != peer.incoming_session_id
+                    {
+                        return;
+                    }
                 }
             }
         }
@@ -546,18 +553,27 @@ impl HostTask {
             }
             CMD_DISCONNECT => {
                 if let (Some(k), CommandBody::Disconnect(d)) = (key, cmd.body) {
-                    if hdr_has_ack {
-                        // Emit ACK immediately before remove_peer destroys the peer state.
-                        if let Some(st) = sent_time {
-                            let a = Self::ack(hdr_channel, hdr_seq, st);
-                            self.emit_by_key(k, &[a], now_ms).await;
+                    // Ignore CMD_DISCONNECT for a peer still in the handshake phase.
+                    // When a client reconnects on the same port, CMD_CONNECT arrives
+                    // (evicting the old peer and allocating a new one at the same slot)
+                    // before CMD_DISCONNECT for the old connection. That stale
+                    // CMD_DISCONNECT must not kill the newly-created peer.
+                    if self.peer(k).map_or(false, |p| p.state == PeerState::AcknowledgingConnect) {
+                        // stale disconnect targeting a new handshake — drop silently
+                    } else {
+                        if hdr_has_ack {
+                            // Emit ACK immediately before remove_peer destroys the peer state.
+                            if let Some(st) = sent_time {
+                                let a = Self::ack(hdr_channel, hdr_seq, st);
+                                self.emit_by_key(k, &[a], now_ms).await;
+                            }
                         }
+                        // Notify the application of the disconnect reason before dropping the channel.
+                        if let Some(p) = self.peer(k) {
+                            let _ = p.to_user.try_send(Err(Some(d.data)));
+                        }
+                        self.remove_peer(k);
                     }
-                    // Notify the application of the disconnect reason before dropping the channel.
-                    if let Some(p) = self.peer(k) {
-                        let _ = p.to_user.try_send(Err(Some(d.data)));
-                    }
-                    self.remove_peer(k);
                 }
             }
             CMD_PING => {
@@ -786,14 +802,18 @@ impl HostTask {
         from: SocketAddr,
         now_ms: u32,
     ) {
-        if self.addr_map.contains_key(&from) {
-            return;
+        // If this address already has a peer slot, evict the old one first.
+        // This handles clients that reconnect on the same source port (e.g. Sauerbraten's
+        // /reconnect reuses the same ENetHost without disconnecting first).
+        if let Some(old_key) = self.addr_map.get(&from).copied() {
+            if let Some(p) = self.peer(old_key) {
+                let _ = p.to_user.try_send(Err(None));
+            }
+            self.remove_peer(old_key);
         }
         let slot = match self.alloc_slot() {
             Some(s) => s,
             None => {
-                warn!("no peer slots available; rejecting CONNECT from {}", from);
-                // Inform the connecting client immediately so it does not time-out waiting.
                 self.send_raw_disconnect(&connect, from, now_ms).await;
                 return;
             }
@@ -1040,9 +1060,6 @@ impl HostTask {
         } else if was_acking_connect {
             if let Some(rx) = rx_for_user {
                 if self.accept_tx.try_send((key, rx)).is_err() {
-                    // Application is not consuming peers fast enough; drop this one to
-                    // free the slot rather than leaking it.
-                    warn!("accept channel full; dropping peer {:?}", key);
                     self.remove_peer(key);
                 }
             }
@@ -1296,6 +1313,12 @@ impl HostTask {
             let Some(p) = self.peer_mut(key) else { return };
             // Idempotent: ignore if already in the disconnect process.
             if matches!(p.state, PeerState::Disconnecting | PeerState::DisconnectLater(_)) {
+                return;
+            }
+            // The peer is still handshaking — it has not been delivered to the user yet
+            // (accept() only fires after Connected). A disconnect request here can only
+            // come from a stale PeerSender whose slot was reused for a new connection.
+            if p.state == PeerState::AcknowledgingConnect {
                 return;
             }
             if !p.outgoing_reliable.is_empty() {
